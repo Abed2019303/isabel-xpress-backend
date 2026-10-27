@@ -8,19 +8,24 @@ const app = express();
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(express.json());
 
-// 1. Initialize Supabase Client using environment variables
+// 1. Initialize Supabase Client
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-// 2. Initialize Nodemailer Transporter using Gmail App Password
+// 2. Initialize Nodemailer Transporter (SSL / Port 465 with explicit timeouts)
 const transporter = nodemailer.createTransport({
-    service: 'gmail',
+    host: 'smtp.gmail.com',
+    port: 465,
+    secure: true, // Use SSL/TLS for Render stability
     auth: {
         user: process.env.EMAIL_USER,
         pass: process.env.EMAIL_PASS
-    }
+    },
+    connectionTimeout: 10000, // 10 seconds timeout
+    greetingTimeout: 10000,
+    socketTimeout: 10000
 });
 
-// 3. Register Endpoint (Handles both full_name and fullName safely)
+// 3. Register Endpoint (Handles full_name, email, and password)
 app.post('/register', async (req, res) => {
     const { full_name, fullName, email, password } = req.body;
     const nameToSave = fullName || full_name;
@@ -44,24 +49,26 @@ app.post('/register', async (req, res) => {
     }
 });
 
-// 4. Login Endpoint
+// 4. Login Endpoint (Supports both username and email input)
 app.post('/login', async (req, res) => {
-    const { email, password } = req.body;
+    const { email, username, password } = req.body;
+    const identifier = username || email;
 
-    if (!email || !password) {
-        return res.status(400).json({ success: false, message: 'Email and password are required.' });
+    if (!identifier || !password) {
+        return res.status(400).json({ success: false, message: 'Username/Email and password are required.' });
     }
 
     try {
+        // Search by email or full_name/username match
         const { data, error } = await supabase
             .from('passengers')
             .select('*')
-            .eq('email', email)
+            .or(`email.eq.${identifier},full_name.eq.${identifier}`)
             .eq('password', password)
             .single();
 
         if (error || !data) {
-            return res.status(400).json({ success: false, message: 'Invalid email or password' });
+            return res.status(400).json({ success: false, message: 'Invalid credentials' });
         }
 
         res.status(200).json({ success: true, message: 'Login successful', user: data });
@@ -70,7 +77,7 @@ app.post('/login', async (req, res) => {
     }
 });
 
-// 5. Forgot Password Endpoint (Sends Email with Live Render Link)
+// 5. Forgot Password Endpoint (Sends Reset Email)
 app.post('/forgot-password', async (req, res) => {
     const { email } = req.body;
 
@@ -104,11 +111,12 @@ app.post('/forgot-password', async (req, res) => {
         await transporter.sendMail(mailOptions);
         res.status(200).json({ success: true, message: 'Password reset link sent to your email.' });
     } catch (err) {
-        res.status(500).json({ success: false, message: 'Server error: ' + err.message });
+        console.error('Email error:', err);
+        res.status(500).json({ success: false, message: 'Email error: ' + err.message });
     }
 });
 
-// 6. Reset Password Web Page View (GET)
+// 6. Reset Password Web View (GET)
 app.get('/reset-password', (req, res) => {
     const email = req.query.email;
     res.send(`
@@ -180,7 +188,7 @@ app.post('/calculate-fare', async (req, res) => {
         const origin = landmarks.find(l => l.id == originLandmarkId);
         const destination = landmarks.find(l => l.id == destinationLandmarkId);
 
-        const R = 6371; // Radius of Earth in km
+        const R = 6371; // Earth radius in km
         const dLat = (destination.latitude - origin.latitude) * (Math.PI / 180);
         const dLon = (destination.longitude - origin.longitude) * (Math.PI / 180);
         const a =
@@ -211,6 +219,7 @@ app.post('/calculate-fare', async (req, res) => {
     }
 });
 
+// 10. Start Server Bound to 0.0.0.0
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on port ${PORT}`);
