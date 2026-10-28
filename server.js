@@ -2,15 +2,13 @@ require('dotenv').config();
 const express = require('express');
 const bodyParser = require('body-parser');
 const { createClient } = require('@supabase/supabase-js');
-const { Resend } = require('resend');
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(express.json());
 
-// 1. Initialize Clients
+// 1. Initialize Supabase Client
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
-const resend = new Resend(process.env.RESEND_API_KEY);
 
 // 2. Register Endpoint
 app.post('/register', async (req, res) => {
@@ -63,87 +61,43 @@ app.post('/login', async (req, res) => {
     }
 });
 
-// 4. Forgot Password Endpoint (Using Resend HTTPS API)
-app.post('/forgot-password', async (req, res) => {
-    const { email } = req.body;
+// 4. Direct In-App Reset Password Endpoint (No Emails Required!)
+app.post('/reset-password-direct', async (req, res) => {
+    const { email, newPassword } = req.body;
 
-    if (!email) {
-        return res.status(400).json({ success: false, message: 'Email is required.' });
+    if (!email || !newPassword) {
+        return res.status(400).json({ success: false, message: 'Email and new password are required.' });
     }
 
     try {
-        const { data, error } = await supabase
+        // First check if the email exists in Supabase
+        const { data: user, error: checkError } = await supabase
             .from('passengers')
             .select('*')
             .eq('email', email)
             .single();
 
-        if (error || !data) {
-            return res.status(404).json({ success: false, message: 'Email not found in database' });
+        if (checkError || !user) {
+            return res.status(404).json({ success: false, message: 'This email is not registered.' });
         }
 
-        const resetLink = `https://isabel-xpress-backend.onrender.com/reset-password?email=${encodeURIComponent(email)}`;
-
-        const response = await resend.emails.send({
-            from: 'onboarding@resend.dev',
-            to: email,
-            subject: 'Password Reset - Isabel Xpress',
-            html: `<h3>Password Reset Request</h3>
-                   <p>Click the link below to reset your password:</p>
-                   <a href="${resetLink}">Reset Password</a>
-                   <p>If you didn't request this, please ignore this email.</p>`
-        });
-
-        if (response.error) {
-            return res.status(500).json({ success: false, message: response.error.message });
-        }
-
-        res.status(200).json({ success: true, message: 'Password reset link sent to your email.' });
-    } catch (err) {
-        console.error('Email error:', err);
-        res.status(500).json({ success: false, message: 'Email error: ' + err.message });
-    }
-});
-
-// 5. Reset Password Web View (GET)
-app.get('/reset-password', (req, res) => {
-    const email = req.query.email;
-    res.send(`
-        <html>
-            <head><title>Reset Password - Isabel Xpress</title></head>
-            <body style="font-family: Arial; padding: 40px; text-align: center;">
-                <h2>Reset Your Password</h2>
-                <form action="/reset-password" method="POST">
-                    <input type="hidden" name="email" value="${email}" />
-                    <input type="password" name="newPassword" placeholder="Enter new password" required style="padding: 10px; width: 250px;" /><br><br>
-                    <button type="submit" style="padding: 10px 20px; background: #007BFF; color: white; border: none; cursor: pointer;">Update Password</button>
-                </form>
-            </body>
-        </html>
-    `);
-});
-
-// 6. Handle Password Update Submission (POST)
-app.post('/reset-password', async (req, res) => {
-    const { email, newPassword } = req.body;
-
-    try {
-        const { error } = await supabase
+        // Update the password directly
+        const { error: updateError } = await supabase
             .from('passengers')
             .update({ password: newPassword })
             .eq('email', email);
 
-        if (error) {
-            return res.status(400).send('Failed to update password.');
+        if (updateError) {
+            return res.status(400).json({ success: false, message: 'Failed to update password.' });
         }
 
-        res.send('<h3 style="color: green; text-align: center; margin-top: 50px;">Password updated successfully! You can now log in to the mobile app.</h3>');
+        res.status(200).json({ success: true, message: 'Password updated successfully!' });
     } catch (err) {
-        res.status(500).send('Server error.');
+        res.status(500).json({ success: false, message: 'Server error: ' + err.message });
     }
 });
 
-// 7. Get Landmarks Endpoint
+// 5. Get Landmarks Endpoint
 app.get('/landmarks', async (req, res) => {
     try {
         const { data, error } = await supabase
@@ -160,7 +114,7 @@ app.get('/landmarks', async (req, res) => {
     }
 });
 
-// 8. Calculate Fare Endpoint
+// 6. Calculate Fare Endpoint
 app.post('/calculate-fare', async (req, res) => {
     const { originLandmarkId, destinationLandmarkId, isDiscounted } = req.body;
 
@@ -208,7 +162,7 @@ app.post('/calculate-fare', async (req, res) => {
     }
 });
 
-// 9. Start Server
+// 7. Start Server
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on port ${PORT}`);
