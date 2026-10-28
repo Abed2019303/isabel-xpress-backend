@@ -1,31 +1,18 @@
 require('dotenv').config();
 const express = require('express');
-const nodemailer = require('nodemailer');
 const bodyParser = require('body-parser');
 const { createClient } = require('@supabase/supabase-js');
+const { Resend } = require('resend');
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(express.json());
 
-// 1. Initialize Supabase Client
+// 1. Initialize Clients
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
+const resend = new Resend(process.env.RESEND_API_KEY);
 
-// 2. Initialize Nodemailer Transporter (SSL / Port 465 with explicit timeouts)
-const transporter = nodemailer.createTransport({
-    host: 'smtp.gmail.com',
-    port: 465,
-    secure: true, // Use SSL/TLS for Render stability
-    auth: {
-        user: process.env.EMAIL_USER,
-        pass: process.env.EMAIL_PASS
-    },
-    connectionTimeout: 10000, // 10 seconds timeout
-    greetingTimeout: 10000,
-    socketTimeout: 10000
-});
-
-// 3. Register Endpoint (Handles full_name, email, and password)
+// 2. Register Endpoint
 app.post('/register', async (req, res) => {
     const { full_name, fullName, email, password } = req.body;
     const nameToSave = fullName || full_name;
@@ -49,7 +36,7 @@ app.post('/register', async (req, res) => {
     }
 });
 
-// 4. Login Endpoint (Supports both username and email input)
+// 3. Login Endpoint (Supports Username or Email)
 app.post('/login', async (req, res) => {
     const { email, username, password } = req.body;
     const identifier = username || email;
@@ -59,7 +46,6 @@ app.post('/login', async (req, res) => {
     }
 
     try {
-        // Search by email or full_name/username match
         const { data, error } = await supabase
             .from('passengers')
             .select('*')
@@ -77,7 +63,7 @@ app.post('/login', async (req, res) => {
     }
 });
 
-// 5. Forgot Password Endpoint (Sends Reset Email)
+// 4. Forgot Password Endpoint (Using Resend HTTPS API)
 app.post('/forgot-password', async (req, res) => {
     const { email } = req.body;
 
@@ -93,22 +79,25 @@ app.post('/forgot-password', async (req, res) => {
             .single();
 
         if (error || !data) {
-            return res.status(404).json({ success: false, message: 'Email not found in our database' });
+            return res.status(404).json({ success: false, message: 'Email not found in database' });
         }
 
         const resetLink = `https://isabel-xpress-backend.onrender.com/reset-password?email=${encodeURIComponent(email)}`;
 
-        const mailOptions = {
-            from: process.env.EMAIL_USER,
+        const response = await resend.emails.send({
+            from: 'onboarding@resend.dev',
             to: email,
             subject: 'Password Reset - Isabel Xpress',
             html: `<h3>Password Reset Request</h3>
                    <p>Click the link below to reset your password:</p>
                    <a href="${resetLink}">Reset Password</a>
                    <p>If you didn't request this, please ignore this email.</p>`
-        };
+        });
 
-        await transporter.sendMail(mailOptions);
+        if (response.error) {
+            return res.status(500).json({ success: false, message: response.error.message });
+        }
+
         res.status(200).json({ success: true, message: 'Password reset link sent to your email.' });
     } catch (err) {
         console.error('Email error:', err);
@@ -116,7 +105,7 @@ app.post('/forgot-password', async (req, res) => {
     }
 });
 
-// 6. Reset Password Web View (GET)
+// 5. Reset Password Web View (GET)
 app.get('/reset-password', (req, res) => {
     const email = req.query.email;
     res.send(`
@@ -134,7 +123,7 @@ app.get('/reset-password', (req, res) => {
     `);
 });
 
-// 7. Handle Password Update Submission (POST)
+// 6. Handle Password Update Submission (POST)
 app.post('/reset-password', async (req, res) => {
     const { email, newPassword } = req.body;
 
@@ -154,7 +143,7 @@ app.post('/reset-password', async (req, res) => {
     }
 });
 
-// 8. Get Landmarks Endpoint
+// 7. Get Landmarks Endpoint
 app.get('/landmarks', async (req, res) => {
     try {
         const { data, error } = await supabase
@@ -171,7 +160,7 @@ app.get('/landmarks', async (req, res) => {
     }
 });
 
-// 9. Calculate Fare Endpoint
+// 8. Calculate Fare Endpoint
 app.post('/calculate-fare', async (req, res) => {
     const { originLandmarkId, destinationLandmarkId, isDiscounted } = req.body;
 
@@ -188,12 +177,12 @@ app.post('/calculate-fare', async (req, res) => {
         const origin = landmarks.find(l => l.id == originLandmarkId);
         const destination = landmarks.find(l => l.id == destinationLandmarkId);
 
-        const R = 6371; // Earth radius in km
+        const R = 6371;
         const dLat = (destination.latitude - origin.latitude) * (Math.PI / 180);
         const dLon = (destination.longitude - origin.longitude) * (Math.PI / 180);
-        const a =
+        const a = 
             Math.sin(dLat / 2) * Math.sin(dLat / 2) +
-            Math.cos(origin.latitude * (Math.PI / 180)) * Math.cos(destination.latitude * (Math.PI / 180)) *
+            Math.cos(origin.latitude * (Math.PI / 180)) * Math.cos(destination.latitude * (Math.PI / 180)) * 
             Math.sin(dLon / 2) * Math.sin(dLon / 2);
         const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
         const distanceKm = R * c;
@@ -219,7 +208,7 @@ app.post('/calculate-fare', async (req, res) => {
     }
 });
 
-// 10. Start Server Bound to 0.0.0.0
+// 9. Start Server
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on port ${PORT}`);
