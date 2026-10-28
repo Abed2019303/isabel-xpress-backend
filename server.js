@@ -61,7 +61,7 @@ app.post('/login', async (req, res) => {
     }
 });
 
-// 4. Direct In-App Reset Password Endpoint (No Emails Required!)
+// 4. Direct In-App Reset Password Endpoint (No Email Required)
 app.post('/reset-password-direct', async (req, res) => {
     const { email, newPassword } = req.body;
 
@@ -70,7 +70,7 @@ app.post('/reset-password-direct', async (req, res) => {
     }
 
     try {
-        // First check if the email exists in Supabase
+        // Step A: Check if the user exists in Supabase
         const { data: user, error: checkError } = await supabase
             .from('passengers')
             .select('*')
@@ -81,7 +81,7 @@ app.post('/reset-password-direct', async (req, res) => {
             return res.status(404).json({ success: false, message: 'This email is not registered.' });
         }
 
-        // Update the password directly
+        // Step B: Update password directly in Supabase
         const { error: updateError } = await supabase
             .from('passengers')
             .update({ password: newPassword })
