@@ -7,10 +7,9 @@ const app = express();
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(express.json());
 
-// 1. Initialize Supabase Client
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-// 2. Register Endpoint
+// Register Endpoint
 app.post('/register', async (req, res) => {
     const { full_name, fullName, email, password } = req.body;
     const nameToSave = fullName || full_name;
@@ -34,7 +33,7 @@ app.post('/register', async (req, res) => {
     }
 });
 
-// 3. Login Endpoint (Supports Username or Email)
+// Login Endpoint
 app.post('/login', async (req, res) => {
     const { email, username, password } = req.body;
     const identifier = username || email;
@@ -61,7 +60,7 @@ app.post('/login', async (req, res) => {
     }
 });
 
-// 4. Direct In-App Reset Password Endpoint (No Email Required)
+// Direct In-App Reset Password (Checks Supabase registration first)
 app.post('/reset-password-direct', async (req, res) => {
     const { email, newPassword } = req.body;
 
@@ -70,18 +69,19 @@ app.post('/reset-password-direct', async (req, res) => {
     }
 
     try {
-        // Step A: Check if the user exists in Supabase
+        // 1. Check if the account is registered in Supabase
         const { data: user, error: checkError } = await supabase
             .from('passengers')
             .select('*')
             .eq('email', email)
             .single();
 
+        // 2. If not registered, reject password change immediately
         if (checkError || !user) {
             return res.status(404).json({ success: false, message: 'This email is not registered.' });
         }
 
-        // Step B: Update password directly in Supabase
+        // 3. If registered, update the password directly
         const { error: updateError } = await supabase
             .from('passengers')
             .update({ password: newPassword })
@@ -97,24 +97,18 @@ app.post('/reset-password-direct', async (req, res) => {
     }
 });
 
-// 5. Get Landmarks Endpoint
+// Landmarks Endpoint
 app.get('/landmarks', async (req, res) => {
     try {
-        const { data, error } = await supabase
-            .from('landmarks')
-            .select('*');
-
-        if (error) {
-            return res.status(400).json({ success: false, message: error.message });
-        }
-
+        const { data, error } = await supabase.from('landmarks').select('*');
+        if (error) return res.status(400).json({ success: false, message: error.message });
         res.status(200).json(data);
     } catch (err) {
         res.status(500).json({ success: false, message: 'Server error: ' + err.message });
     }
 });
 
-// 6. Calculate Fare Endpoint
+// Calculate Fare Endpoint
 app.post('/calculate-fare', async (req, res) => {
     const { originLandmarkId, destinationLandmarkId, isDiscounted } = req.body;
 
@@ -147,9 +141,7 @@ app.post('/calculate-fare', async (req, res) => {
         }
 
         let totalFare = baseFare;
-        if (isDiscounted) {
-            totalFare *= 0.8;
-        }
+        if (isDiscounted) totalFare *= 0.8;
 
         res.status(200).json({
             distanceKm: parseFloat(distanceKm.toFixed(2)),
@@ -162,7 +154,6 @@ app.post('/calculate-fare', async (req, res) => {
     }
 });
 
-// 7. Start Server
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on port ${PORT}`);
