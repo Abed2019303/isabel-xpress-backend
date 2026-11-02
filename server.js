@@ -9,6 +9,12 @@ app.use(express.json());
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
+// Helper function for password complexity validation (min 12 chars, 1 uppercase, 1 number, 1 special char)
+const isValidPassword = (password) => {
+    const regex = /^(?=.*\d)(?=.*[A-Z])(?=.*[@#$%^&+=!_]).{12,}$/;
+    return regex.test(password);
+};
+
 // Register Endpoint
 app.post('/register', async (req, res) => {
     const { full_name, fullName, email, password } = req.body;
@@ -16,6 +22,13 @@ app.post('/register', async (req, res) => {
 
     if (!nameToSave || !email || !password) {
         return res.status(400).json({ success: false, message: 'All fields are required.' });
+    }
+
+    if (!isValidPassword(password)) {
+        return res.status(400).json({ 
+            success: false, 
+            message: 'Password must be at least 12 characters long and include a number, capital letter, and special character.' 
+        });
     }
 
     try {
@@ -33,10 +46,10 @@ app.post('/register', async (req, res) => {
     }
 });
 
-// Login Endpoint
+// Login Endpoint (Supports Email or Username lookup)
 app.post('/login', async (req, res) => {
     const { email, username, password } = req.body;
-    const identifier = username || email;
+    const identifier = email || username;
 
     if (!identifier || !password) {
         return res.status(400).json({ success: false, message: 'Username/Email and password are required.' });
@@ -60,7 +73,7 @@ app.post('/login', async (req, res) => {
     }
 });
 
-// Direct In-App Reset Password (Checks Supabase registration first)
+// Direct In-App Reset Password (Checks Supabase registration first & validates complexity)
 app.post('/reset-password-direct', async (req, res) => {
     const { email, newPassword } = req.body;
 
@@ -68,20 +81,24 @@ app.post('/reset-password-direct', async (req, res) => {
         return res.status(400).json({ success: false, message: 'Email and new password are required.' });
     }
 
+    if (!isValidPassword(newPassword)) {
+        return res.status(400).json({ 
+            success: false, 
+            message: 'Password must be at least 12 characters long and include a number, capital letter, and special character.' 
+        });
+    }
+
     try {
-        // 1. Check if the account is registered in Supabase
         const { data: user, error: checkError } = await supabase
             .from('passengers')
             .select('*')
             .eq('email', email)
             .single();
 
-        // 2. If not registered, reject password change immediately
         if (checkError || !user) {
             return res.status(404).json({ success: false, message: 'This email is not registered.' });
         }
 
-        // 3. If registered, update the password directly
         const { error: updateError } = await supabase
             .from('passengers')
             .update({ password: newPassword })
