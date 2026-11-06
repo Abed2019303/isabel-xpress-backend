@@ -141,9 +141,14 @@ app.post('/driver-register', async (req, res) => {
             }])
             .select();
 
-        if (error) return res.status(400).json({ success: false, message: error.message });
+        if (error) {
+            console.error("SUPABASE INSERT ERROR:", error);
+            return res.status(400).json({ success: false, message: error.message });
+        }
+
         res.status(200).json({ success: true, message: 'Driver registered successfully', user: data[0] });
     } catch (err) {
+        console.error("SERVER CRASH ERROR:", err);
         res.status(500).json({ success: false, message: err.message });
     }
 });
