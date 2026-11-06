@@ -73,7 +73,7 @@ app.post('/login', async (req, res) => {
     }
 });
 
-// Direct In-App Reset Password
+// Direct In-App Reset Password (Passenger)
 app.post('/reset-password-direct', async (req, res) => {
     const { email, newPassword } = req.body;
 
@@ -118,9 +118,27 @@ app.post('/reset-password-direct', async (req, res) => {
 app.post('/driver-register', async (req, res) => {
     try {
         const { fullName, email, password, bodyNumber } = req.body;
+
+        if (!fullName || !email || !password || !bodyNumber) {
+            return res.status(400).json({ success: false, message: 'All fields are required.' });
+        }
+
+        if (!isValidPassword(password)) {
+            return res.status(400).json({ 
+                success: false, 
+                message: 'Password must be at least 12 characters long and include a number, capital letter, and special character.' 
+            });
+        }
+
         const { data, error } = await supabase
             .from('drivers')
-            .insert([{ full_name: fullName, email, password, body_number: bodyNumber, is_online: false }])
+            .insert([{ 
+                full_name: fullName, 
+                email: email, 
+                password: password, 
+                toda_body_number: bodyNumber, 
+                is_online: false 
+            }])
             .select();
 
         if (error) return res.status(400).json({ success: false, message: error.message });
@@ -145,6 +163,47 @@ app.post('/driver-login', async (req, res) => {
         res.status(200).json({ success: true, message: 'Login successful', user: data });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// Driver Direct Reset Password Endpoint
+app.post('/driver-reset-password', async (req, res) => {
+    const { email, newPassword } = req.body;
+
+    if (!email || !newPassword) {
+        return res.status(400).json({ success: false, message: 'Email and new password are required.' });
+    }
+
+    if (!isValidPassword(newPassword)) {
+        return res.status(400).json({ 
+            success: false, 
+            message: 'Password must be at least 12 characters long and include a number, capital letter, and special character.' 
+        });
+    }
+
+    try {
+        const { data: user, error: checkError } = await supabase
+            .from('drivers')
+            .select('*')
+            .eq('email', email)
+            .single();
+
+        if (checkError || !user) {
+            return res.status(404).json({ success: false, message: 'Driver email is not registered.' });
+        }
+
+        const { error: updateError } = await supabase
+            .from('drivers')
+            .update({ password: newPassword })
+            .eq('email', email);
+
+        if (updateError) {
+            return res.status(400).json({ success: false, message: 'Failed to update driver password.' });
+        }
+
+        res.status(200).json({ success: true, message: 'Driver password updated successfully!' });
+    } catch (err) {
+        res.status(500).json({ success: false, message: 'Server error: ' + err.message });
     }
 });
 
