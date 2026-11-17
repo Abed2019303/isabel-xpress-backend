@@ -401,6 +401,213 @@ io.on('connection', (socket) => {
     socket.on('disconnect', () => {
         console.log('Socket disconnected:', socket.id);
     });
+    // ---------------------------------------------------------------------------
+// Bookings (saved in the "bookings" table)
+// ---------------------------------------------------------------------------
+
+// Passenger creates a booking
+app.post('/bookings', async (req, res) => {
+    try {
+        const {
+            passengerId, passengerName, passengerEmail,
+            pickupName, destinationName, distanceKm, fare, isDiscounted
+        } = req.body;
+
+        if (!passengerId || !passengerName || !pickupName || !destinationName || fare === undefined) {
+            return res.status(400).json({ success: false, message: 'Missing booking details.' });
+        }
+
+        // One active booking per passenger
+        const { data: existing } = await supabase
+            .from('bookings')
+            .select('id')
+            .eq('passenger_id', passengerId)
+            .in('status', ['PENDING', 'ACCEPTED'])
+            .limit(1);
+
+        if (existing && existing.length > 0) {
+            return res.status(409).json({ success: false, message: 'You already have an active booking.' });
+        }
+
+        const { data, error } = await supabase
+            .from('bookings')
+            .insert([{
+                passenger_id: passengerId,
+                passenger_name: passengerName,
+                passenger_email: passengerEmail || null,
+                pickup_name: pickupName,
+                destination_name: destinationName,
+                distance_km: distanceKm ?? null,
+                fare: fare,
+                is_discounted: isDiscounted === true,
+                status: 'PENDING'
+            }])
+            .select()
+            .single();
+
+        if (error) {
+            console.error('BOOKING INSERT ERROR:', error);
+            return res.status(400).json({ success: false, message: error.message });
+        }
+
+        io.to('drivers').emit('new_booking', data);
+        res.status(200).json({ success: true, message: 'Booking created', booking: data });
+    } catch (err) {
+        console.error('BOOKING CREATE ERROR:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// Pending bookings for the driver dashboard
+app.get('/bookings/available', async (req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('bookings')
+            .select('*')
+            .eq('status', 'PENDING')
+            .order('created_at', { ascending: true });
+
+        if (error) return res.status(400).json({ success: false, message: error.message });
+        res.status(200).json({ success: true, bookings: data });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// Active booking of a passenger (?passengerId=) or of a driver (?driverId=)
+app.get('/bookings/active', async (req, res) => {
+    try {
+        const { passengerId, driverId } = req.query;
+
+        let query = supabase.from('bookings').select('*');
+
+        if (passengerId) {
+            query = query.eq('passenger_id', passengerId).in('status', ['PENDING', 'ACCEPTED']);
+        } else if (driverId) {
+            query = query.eq('driver_id', driverId).eq('status', 'ACCEPTED');
+        } else {
+            return res.status(400).json({ success: false, message: 'passengerId or driverId is required.' });
+        }
+
+        const { data, error } = await query.order('created_at', { ascending: false }).limit(1);
+        if (error) return res.status(400).json({ success: false, message: error.message });
+
+        res.status(200).json({ success: true, booking: data && data.length ? data[0] : null });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// One booking (the passenger app polls this as a backup to the socket)
+app.get('/bookings/:id', async (req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('bookings')
+            .select('*')
+            .eq('id', req.params.id)
+            .maybeSingle();
+
+        if (error) return res.status(400).json({ success: false, message: error.message });
+        if (!data) return res.status(404).json({ success: false, message: 'Booking not found.' });
+
+        res.status(200).json({ success: true, booking: data });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// Driver accepts a booking
+app.post('/bookings/:id/accept', async (req, res) => {
+    try {
+        const { driverId } = req.body;
+        if (!driverId) {
+            return res.status(400).json({ success: false, message: 'driverId is required.' });
+        }
+
+        const { data: driver } = await supabase
+            .from('drivers')
+            .select('id, full_name, toda_body_number')
+            .eq('id', driverId)
+            .maybeSingle();
+
+        if (!driver) {
+            return res.status(404).json({ success: false, message: 'Driver not found.' });
+        }
+
+        // A driver can only have one trip at a time
+        const { data: busy } = await supabase
+            .from('bookings')
+            .select('id')
+            .eq('driver_id', driverId)
+            .eq('status', 'ACCEPTED')
+            .limit(1);
+
+        if (busy && busy.length > 0) {
+            return res.status(409).json({ success: false, message: 'Finish your current trip first.' });
+        }
+
+        // Only succeeds if the booking is still PENDING, so two drivers can't take it
+        const { data, error } = await supabase
+            .from('bookings')
+            .update({
+                status: 'ACCEPTED',
+                driver_id: driver.id,
+                driver_name: driver.full_name,
+                driver_body_number: driver.toda_body_number,
+                accepted_at: new Date().toISOString()
+            })
+            .eq('id', req.params.id)
+            .eq('status', 'PENDING')
+            .select();
+
+        if (error) return res.status(400).json({ success: false, message: error.message });
+
+        if (!data || data.length === 0) {
+            return res.status(409).json({ success: false, message: 'This booking was already taken.' });
+        }
+
+        const booking = data[0];
+        io.to(`passenger:${booking.passenger_id}`).emit('booking_accepted', booking);
+        io.to('drivers').emit('booking_taken', { id: booking.id });
+
+        res.status(200).json({ success: true, message: 'Booking accepted', booking });
+    } catch (err) {
+        console.error('BOOKING ACCEPT ERROR:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// Driver completes the trip
+app.post('/bookings/:id/complete', async (req, res) => {
+    try {
+        const { driverId } = req.body;
+        if (!driverId) {
+            return res.status(400).json({ success: false, message: 'driverId is required.' });
+        }
+
+        const { data, error } = await supabase
+            .from('bookings')
+            .update({ status: 'COMPLETED', completed_at: new Date().toISOString() })
+            .eq('id', req.params.id)
+            .eq('driver_id', driverId)
+            .eq('status', 'ACCEPTED')
+            .select();
+
+        if (error) return res.status(400).json({ success: false, message: error.message });
+
+        if (!data || data.length === 0) {
+            return res.status(409).json({ success: false, message: 'No active trip to complete.' });
+        }
+
+        const booking = data[0];
+        io.to(`passenger:${booking.passenger_id}`).emit('booking_completed', booking);
+
+        res.status(200).json({ success: true, message: 'Trip completed', booking });
+    } catch (err) {
+        console.error('BOOKING COMPLETE ERROR:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
 });
 
 const PORT = process.env.PORT || 10000;
