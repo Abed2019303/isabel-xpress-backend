@@ -1,13 +1,19 @@
 require('dotenv').config();
-const express = require('express');
+const path = require('path');
+const crypto = require('crypto');
 const http = require('http');
+const express = require('express');
 const bcrypt = require('bcryptjs');
 const { Server } = require('socket.io');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
+app.set('trust proxy', 1); // Render sits behind a proxy
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
+
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: '*' } });
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
@@ -25,8 +31,7 @@ const isValidPassword = (password) => {
 
 const hashPassword = (plain) => bcrypt.hash(plain, 10);
 
-// Supports old plain-text rows: if the stored value is not a bcrypt hash,
-// compare directly and upgrade the row to a hash on success.
+// Supports old plain-text rows: compares directly, then upgrades the row to a hash
 async function verifyPassword(table, row, plain) {
     const stored = row.password || '';
     if (stored.startsWith('$2')) {
@@ -45,6 +50,39 @@ const stripPassword = (row) => {
     const { password, ...safe } = row;
     return safe;
 };
+
+// Admin access: header "x-admin-key" must match the ADMIN_KEY environment variable.
+// 10 wrong tries from one address blocks it for 15 minutes.
+const ADMIN_KEY = process.env.ADMIN_KEY || '';
+const adminFails = new Map();
+
+function requireAdmin(req, res, next) {
+    const ip = req.ip;
+    const rec = adminFails.get(ip) || { count: 0, until: 0 };
+
+    if (rec.until > Date.now()) {
+        return res.status(429).json({ success: false, message: 'Too many attempts. Try again later.' });
+    }
+
+    const provided = Buffer.from(req.get('x-admin-key') || '');
+    const expected = Buffer.from(ADMIN_KEY);
+    const ok = ADMIN_KEY.length > 0 &&
+        provided.length === expected.length &&
+        crypto.timingSafeEqual(provided, expected);
+
+    if (!ok) {
+        rec.count += 1;
+        if (rec.count >= 10) {
+            rec.until = Date.now() + 15 * 60 * 1000;
+            rec.count = 0;
+        }
+        adminFails.set(ip, rec);
+        return res.status(401).json({ success: false, message: 'Invalid admin key.' });
+    }
+
+    adminFails.delete(ip);
+    next();
+}
 
 // ---------------------------------------------------------------------------
 // Health check
@@ -158,6 +196,7 @@ app.post('/reset-password-direct', async (req, res) => {
 // Driver
 // ---------------------------------------------------------------------------
 
+// New drivers start unverified until the administrator approves them
 app.post('/driver-register', async (req, res) => {
     try {
         const { full_name, fullName, email, password, toda_body_number, bodyNumber } = req.body;
@@ -178,7 +217,8 @@ app.post('/driver-register', async (req, res) => {
                 email: email,
                 password: await hashPassword(password),
                 toda_body_number: bodyToSave,
-                is_online: false
+                is_online: false,
+                is_verified: false
             }])
             .select();
 
@@ -189,7 +229,7 @@ app.post('/driver-register', async (req, res) => {
 
         res.status(200).json({
             success: true,
-            message: 'Driver registered successfully',
+            message: 'Registration received. You can log in after the administrator verifies your TODA details.',
             user: stripPassword(data[0])
         });
     } catch (err) {
@@ -219,6 +259,14 @@ app.post('/driver-login', async (req, res) => {
 
         if (!data || !(await verifyPassword('drivers', data, password))) {
             return res.status(401).json({ success: false, message: 'Invalid driver credentials' });
+        }
+
+        // Checked after the password so the status is not revealed to strangers
+        if (!data.is_verified) {
+            return res.status(403).json({
+                success: false,
+                message: 'Your account is waiting for verification by the administrator. Please try again later.'
+            });
         }
 
         res.status(200).json({ success: true, message: 'Login successful', user: stripPassword(data) });
@@ -266,12 +314,28 @@ app.post('/driver-reset-password', async (req, res) => {
     }
 });
 
+// Online/offline. Only verified drivers can go online.
 app.post('/driver-status', async (req, res) => {
     try {
         const { driverId, isOnline } = req.body;
 
-        if (driverId === undefined || typeof isOnline !== 'boolean') {
+        if (!driverId || typeof isOnline !== 'boolean') {
             return res.status(400).json({ success: false, message: 'driverId and isOnline (true/false) are required.' });
+        }
+
+        if (isOnline) {
+            const { data: driver } = await supabase
+                .from('drivers')
+                .select('id, is_verified')
+                .eq('id', driverId)
+                .maybeSingle();
+
+            if (!driver) {
+                return res.status(404).json({ success: false, message: 'Driver not found.' });
+            }
+            if (!driver.is_verified) {
+                return res.status(403).json({ success: false, message: 'Your account is not verified yet.' });
+            }
         }
 
         const { error } = await supabase
@@ -286,12 +350,14 @@ app.post('/driver-status', async (req, res) => {
     }
 });
 
+// Online, verified drivers - public fields only
 app.get('/available-drivers', async (req, res) => {
     try {
         const { data, error } = await supabase
             .from('drivers')
             .select('id, full_name, toda_body_number, is_online')
-            .eq('is_online', true);
+            .eq('is_online', true)
+            .eq('is_verified', true);
 
         if (error) return res.status(400).json({ success: false, message: error.message });
         res.status(200).json({ success: true, drivers: data });
@@ -358,7 +424,7 @@ app.post('/calculate-fare', async (req, res) => {
         }
 
         const discounted = isDiscounted === true || isDiscounted === 'true';
-        const totalFare = discounted ? baseFare * 0.8 : baseFare;
+        const totalFare = discounted ? baseFare * 0.8 : baseFare; // 20% discount
 
         res.status(200).json({
             distanceKm: parseFloat(distanceKm.toFixed(2)),
@@ -373,39 +439,9 @@ app.post('/calculate-fare', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// Socket.IO
-// ---------------------------------------------------------------------------
-
-const server = http.createServer(app);
-const io = new Server(server, { cors: { origin: '*' } });
-
-io.on('connection', (socket) => {
-    console.log('Socket connected:', socket.id);
-
-    socket.on('passenger_booking_request', (data) => {
-        socket.broadcast.emit('passenger_booking_request', data);
-    });
-
-    socket.on('driver_accept_booking', (data) => {
-        socket.broadcast.emit('booking_accepted', data);
-    });
-
-    socket.on('chat_message', (data) => {
-        socket.broadcast.emit('chat_message', data);
-    });
-
-    socket.on('location_changed', (data) => {
-        socket.broadcast.emit('location_changed', data);
-    });
-
-    socket.on('disconnect', () => {
-        console.log('Socket disconnected:', socket.id);
-    });
-    // ---------------------------------------------------------------------------
 // Bookings (saved in the "bookings" table)
 // ---------------------------------------------------------------------------
 
-// Passenger creates a booking
 app.post('/bookings', async (req, res) => {
     try {
         const {
@@ -417,7 +453,6 @@ app.post('/bookings', async (req, res) => {
             return res.status(400).json({ success: false, message: 'Missing booking details.' });
         }
 
-        // One active booking per passenger
         const { data: existing } = await supabase
             .from('bookings')
             .select('id')
@@ -458,7 +493,7 @@ app.post('/bookings', async (req, res) => {
     }
 });
 
-// Pending bookings for the driver dashboard
+// Order matters: /available and /active must come before /:id
 app.get('/bookings/available', async (req, res) => {
     try {
         const { data, error } = await supabase
@@ -474,7 +509,6 @@ app.get('/bookings/available', async (req, res) => {
     }
 });
 
-// Active booking of a passenger (?passengerId=) or of a driver (?driverId=)
 app.get('/bookings/active', async (req, res) => {
     try {
         const { passengerId, driverId } = req.query;
@@ -498,7 +532,6 @@ app.get('/bookings/active', async (req, res) => {
     }
 });
 
-// One booking (the passenger app polls this as a backup to the socket)
 app.get('/bookings/:id', async (req, res) => {
     try {
         const { data, error } = await supabase
@@ -516,7 +549,7 @@ app.get('/bookings/:id', async (req, res) => {
     }
 });
 
-// Driver accepts a booking
+// Driver accepts a booking (verified drivers only)
 app.post('/bookings/:id/accept', async (req, res) => {
     try {
         const { driverId } = req.body;
@@ -526,15 +559,17 @@ app.post('/bookings/:id/accept', async (req, res) => {
 
         const { data: driver } = await supabase
             .from('drivers')
-            .select('id, full_name, toda_body_number')
+            .select('id, full_name, toda_body_number, is_verified')
             .eq('id', driverId)
             .maybeSingle();
 
         if (!driver) {
             return res.status(404).json({ success: false, message: 'Driver not found.' });
         }
+        if (!driver.is_verified) {
+            return res.status(403).json({ success: false, message: 'Your account is not verified yet.' });
+        }
 
-        // A driver can only have one trip at a time
         const { data: busy } = await supabase
             .from('bookings')
             .select('id')
@@ -577,7 +612,6 @@ app.post('/bookings/:id/accept', async (req, res) => {
     }
 });
 
-// Driver completes the trip
 app.post('/bookings/:id/complete', async (req, res) => {
     try {
         const { driverId } = req.body;
@@ -608,6 +642,100 @@ app.post('/bookings/:id/complete', async (req, res) => {
         res.status(500).json({ success: false, message: err.message });
     }
 });
+
+// ---------------------------------------------------------------------------
+// Admin (page + API). The page is public, but every API call needs ADMIN_KEY.
+// ---------------------------------------------------------------------------
+
+app.get('/admin', (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    res.sendFile(path.join(__dirname, 'admin.html'));
+});
+
+app.get('/admin/api/drivers', requireAdmin, async (req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('drivers')
+            .select('id, full_name, email, toda_body_number, vehicle_model, is_online, is_verified, verified_at, created_at')
+            .order('created_at', { ascending: false });
+
+        if (error) return res.status(400).json({ success: false, message: error.message });
+        res.status(200).json({ success: true, drivers: data });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// Body: { "verified": true } to approve, { "verified": false } to suspend
+app.post('/admin/api/drivers/:id/verify', requireAdmin, async (req, res) => {
+    try {
+        const verified = req.body.verified === true;
+
+        const update = verified
+            ? { is_verified: true, verified_at: new Date().toISOString() }
+            : { is_verified: false, verified_at: null, is_online: false };
+
+        const { data, error } = await supabase
+            .from('drivers')
+            .update(update)
+            .eq('id', req.params.id)
+            .select('id, full_name, is_verified');
+
+        if (error) return res.status(400).json({ success: false, message: error.message });
+        if (!data || data.length === 0) {
+            return res.status(404).json({ success: false, message: 'Driver not found.' });
+        }
+
+        res.status(200).json({ success: true, message: verified ? 'Driver verified' : 'Driver suspended', driver: data[0] });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+app.get('/admin/api/bookings', requireAdmin, async (req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('bookings')
+            .select('*')
+            .order('created_at', { ascending: false })
+            .limit(200);
+
+        if (error) return res.status(400).json({ success: false, message: error.message });
+        res.status(200).json({ success: true, bookings: data });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// ---------------------------------------------------------------------------
+// Socket.IO (live notifications; the database is the source of truth)
+// ---------------------------------------------------------------------------
+
+io.on('connection', (socket) => {
+    console.log('Socket connected:', socket.id);
+
+    socket.on('join_drivers', () => socket.join('drivers'));
+
+    socket.on('join_passenger', (d) => {
+        if (d && d.passengerId) socket.join(`passenger:${d.passengerId}`);
+    });
+
+    socket.on('join_booking', (d) => {
+        if (d && d.bookingId) socket.join(`booking:${d.bookingId}`);
+    });
+
+    // Chat goes only to the other person in the same booking
+    socket.on('chat_message', (d) => {
+        if (d && d.bookingId) socket.to(`booking:${d.bookingId}`).emit('chat_message', d);
+    });
+
+    socket.on('location_changed', (data) => {
+        socket.broadcast.emit('location_changed', data);
+    });
+
+    socket.on('disconnect', () => {
+        console.log('Socket disconnected:', socket.id);
+    });
 });
 
 const PORT = process.env.PORT || 10000;
