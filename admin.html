@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Isabel-Xpress Admin</title>
+<style>
+  :root {
+    --bg: #f4f6f8; --card: #ffffff; --text: #1c2733; --muted: #5f6b7a; --line: #e2e8ee;
+    --primary: #00695c; --primary-text: #ffffff; --danger: #b3261e;
+    --warn-bg: #fff4e0; --warn-text: #8a5300; --ok-bg: #e3f6e8; --ok-text: #1b6b34;
+    --info-bg: #e3f2fd; --info-text: #0b4f8a; --gray-bg: #eceff1; --gray-text: #455a64;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #10161c; --card: #18212a; --text: #e6edf3; --muted: #9aa7b4; --line: #2a3642;
+      --primary: #26a69a; --primary-text: #06201d; --danger: #ff8a80;
+      --warn-bg: #3a2c10; --warn-text: #ffcb7a; --ok-bg: #12351f; --ok-text: #7fdc9b;
+      --info-bg: #10304a; --info-text: #8cc8f5; --gray-bg: #25303a; --gray-text: #b8c4cf;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+         background: var(--bg); color: var(--text); }
+  header { display: flex; align-items: center; justify-content: space-between; gap: 12px;
+           padding: 14px 20px; background: var(--primary); color: var(--primary-text); }
+  header h1 { margin: 0; font-size: 1.15rem; }
+  .header-actions { display: flex; align-items: center; gap: 10px; }
+  #updated { font-size: .8rem; opacity: .85; }
+  main { max-width: 1100px; margin: 0 auto; padding: 20px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; }
+  .narrow { max-width: 380px; margin: 60px auto; }
+  h2 { margin: 0 0 8px; font-size: 1.05rem; }
+  .muted { color: var(--muted); font-size: .9rem; }
+  label { display: block; margin: 14px 0 6px; font-size: .9rem; }
+  input, select { width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--line);
+                  background: var(--bg); color: var(--text); font-size: 1rem; }
+  button { font: inherit; cursor: pointer; border: 0; border-radius: 8px; padding: 9px 14px;
+           background: var(--primary); color: var(--primary-text); }
+  button.ghost { background: transparent; color: inherit; border: 1px solid currentColor; padding: 6px 12px; }
+  button.danger { background: transparent; color: var(--danger); border: 1px solid var(--danger); }
+  button:disabled { opacity: .5; cursor: default; }
+  #btnLogin { margin-top: 16px; width: 100%; }
+  .error { color: var(--danger); min-height: 1.2em; margin: 10px 0 0; font-size: .9rem; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-bottom: 16px; }
+  .stat { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; }
+  .stat .n { font-size: 1.6rem; font-weight: 700; }
+  .stat .l { color: var(--muted); font-size: .8rem; }
+  .tabs { display: flex; gap: 8px; margin-bottom: 12px; }
+  .tab { background: var(--card); color: var(--text); border: 1px solid var(--line); }
+  .tab.active { background: var(--primary); color: var(--primary-text); border-color: var(--primary); }
+  .toolbar { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+  .toolbar select { width: auto; }
+  .table-wrap { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: .92rem; }
+  th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; white-space: nowrap; }
+  th { color: var(--muted); font-weight: 600; font-size: .8rem; text-transform: uppercase; letter-spacing: .03em; }
+  .badge { display: inline-block; padding: 3px 9px; border-radius: 999px; font-size: .78rem; font-weight: 600; }
+  .b-warn { background: var(--warn-bg); color: var(--warn-text); }
+  .b-ok { background: var(--ok-bg); color: var(--ok-text); }
+  .b-info { background: var(--info-bg); color: var(--info-text); }
+  .b-gray { background: var(--gray-bg); color: var(--gray-text); }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; background: #9aa7b4; }
+  .dot.on { background: #2e9e57; }
+  .empty { text-align: center; color: var(--muted); padding: 24px 8px; }
+  #toast { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); background: #263238; color: #fff;
+           padding: 10px 16px; border-radius: 8px; font-size: .9rem; display: none; max-width: 90%; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Isabel-Xpress Admin</h1>
+  <div class="header-actions">
+    <span id="updated"></span>
+    <button id="btnRefresh" class="ghost" hidden>Refresh</button>
+    <button id="btnLogout" class="ghost" hidden>Sign out</button>
+  </div>
+</header>
+
+<main>
+  <section id="loginView" class="card narrow">
+    <h2>Administrator sign-in</h2>
+    <p class="muted">Enter the admin key that was set on the server.</p>
+    <label for="keyInput">Admin key</label>
+    <input id="keyInput" type="password" autocomplete="current-password">
+    <button id="btnLogin">Sign in</button>
+    <p id="loginError" class="error" role="alert"></p>
+  </section>
+
+  <section id="appView" hidden>
+    <div id="stats" class="stats"></div>
+
+    <div class="tabs">
+      <button id="tabDrivers" class="tab active">Drivers</button>
+      <button id="tabBookings" class="tab">Bookings</button>
+    </div>
+
+    <div id="panelDrivers" class="card">
+      <h2>Driver verification</h2>
+      <p class="muted">Check each driver's TODA body number against the official list, then verify. Unverified drivers cannot log in or accept bookings.</p>
+      <div class="table-wrap"><table id="driversTable"></table></div>
+    </div>
+
+    <div id="panelBookings" class="card" hidden>
+      <h2>Bookings and trip records</h2>
+      <div class="toolbar">
+        <label for="statusFilter" style="margin:0">Status</label>
+        <select id="statusFilter">
+          <option value="ALL">All</option>
+          <option value="PENDING">Pending</option>
+          <option value="ACCEPTED">Accepted</option>
+          <option value="COMPLETED">Completed</option>
+          <option value="CANCELLED">Cancelled</option>
+        </select>
+      </div>
+      <div class="table-wrap"><table id="bookingsTable"></table></div>
+    </div>
+  </section>
+</main>
+
+<div id="toast" role="status"></div>
+
+<script>
+(function () {
+  const $ = (id) => document.getElementById(id);
+  let adminKey = sessionStorage.getItem('adminKey') || '';
+  let drivers = [];
+  let bookings = [];
+  let timer = null;
+
+  // Builds elements with textContent only, so database text can never inject HTML
+  function h(tag, props, ...kids) {
+    const n = document.createElement(tag);
+    if (props) {
+      for (const [k, v] of Object.entries(props)) {
+        if (k === 'class') n.className = v;
+        else if (k.startsWith('on')) n.addEventListener(k.slice(2), v);
+        else n.setAttribute(k, v);
+      }
+    }
+    for (const kid of kids.flat()) {
+      if (kid === null || kid === undefined) continue;
+      n.append(kid);
+    }
+    return n;
+  }
+
+  function toast(msg) {
+    const t = $('toast');
+    t.textContent = msg;
+    t.style.display = 'block';
+    clearTimeout(toast.t);
+    toast.t = setTimeout(() => { t.style.display = 'none'; }, 3500);
+  }
+
+  async function api(path, options = {}) {
+    const res = await fetch(path, {
+      ...options,
+      headers: { 'Content-Type': 'application/json', 'x-admin-key': adminKey }
+    });
+    let data = {};
+    try { data = await res.json(); } catch (e) { /* ignore */ }
+    if (res.status === 401 || res.status === 429) {
+      const err = new Error(data.message || 'Not authorised');
+      err.auth = true;
+      throw err;
+    }
+    if (!res.ok || data.success === false) {
+      throw new Error(data.message || 'Request failed (' + res.status + ')');
+    }
+    return data;
+  }
+
+  function showLogin(msg) {
+    clearInterval(timer); timer = null;
+    $('appView').hidden = true;
+    $('loginView').hidden = false;
+    $('btnRefresh').hidden = true;
+    $('btnLogout').hidden = true;
+    $('updated').textContent = '';
+    $('loginError').textContent = msg || '';
+  }
+
+  function showApp() {
+    $('loginView').hidden = true;
+    $('appView').hidden = false;
+    $('btnRefresh').hidden = false;
+    $('btnLogout').hidden = false;
+    if (!timer) timer = setInterval(loadAll, 10000);
+  }
+
+  async function loadAll() {
+    try {
+      const [d, b] = await Promise.all([api('/admin/api/drivers'), api('/admin/api/bookings')]);
+      drivers = d.drivers || [];
+      bookings = b.bookings || [];
+      showApp();
+      renderStats();
+      renderDrivers();
+      renderBookings();
+      $('updated').textContent = 'Updated ' + new Date().toLocaleTimeString();
+    } catch (e) {
+      if (e.auth) {
+        sessionStorage.removeItem('adminKey');
+        adminKey = '';
+        showLogin(e.message);
+      } else {
+        toast(e.message);
+      }
+    }
+  }
+
+  const fmtDate = (iso) => iso ? new Date(iso).toLocaleString() : '-';
+  const fmtFare = (n) => '\u20B1' + Number(n || 0).toFixed(2);
+
+  function badge(text, cls) { return h('span', { class: 'badge ' + cls }, text); }
+
+  function statusBadge(status) {
+    const map = { PENDING: 'b-warn', ACCEPTED: 'b-info', COMPLETED: 'b-ok', CANCELLED: 'b-gray' };
+    return badge(status || '-', map[status] || 'b-gray');
+  }
+
+  function renderStats() {
+    const count = (fn, list) => list.filter(fn).length;
+    const items = [
+      ['Drivers', drivers.length],
+      ['Pending verification', count((x) => !x.is_verified, drivers)],
+      ['Verified', count((x) => x.is_verified, drivers)],
+      ['Online now', count((x) => x.is_online, drivers)],
+      ['Pending bookings', count((x) => x.status === 'PENDING', bookings)],
+      ['Trips in progress', count((x) => x.status === 'ACCEPTED', bookings)],
+      ['Completed trips', count((x) => x.status === 'COMPLETED', bookings)]
+    ];
+    const box = $('stats');
+    box.replaceChildren(...items.map(([label, n]) =>
+      h('div', { class: 'stat' }, h('div', { class: 'n' }, String(n)), h('div', { class: 'l' }, label))));
+  }
+
+  async function setVerified(driver, verified) {
+    if (!verified && !confirm('Suspend ' + driver.full_name + '? They will be taken offline and cannot log in.')) return;
+    try {
+      await api('/admin/api/drivers/' + encodeURIComponent(driver.id) + '/verify', {
+        method: 'POST',
+        body: JSON.stringify({ verified })
+      });
+      toast(driver.full_name + (verified ? ' verified' : ' suspended'));
+      loadAll();
+    } catch (e) {
+      toast(e.message);
+    }
+  }
+
+  function renderDrivers() {
+    const sorted = [...drivers].sort((a, b) =>
+      (a.is_verified === b.is_verified ? 0 : a.is_verified ? 1 : -1) ||
+      new Date(b.created_at) - new Date(a.created_at));
+
+    const head = h('thead', null, h('tr', null,
+      ['Name', 'Email', 'Body #', 'Vehicle', 'Status', 'Online', 'Registered', ''].map((t) => h('th', null, t))));
+
+    const rows = sorted.map((d) => h('tr', null,
+      h('td', null, d.full_name),
+      h('td', null, d.email),
+      h('td', null, d.toda_body_number || '-'),
+      h('td', null, d.vehicle_model || '-'),
+      h('td', null, d.is_verified ? badge('Verified', 'b-ok') : badge('Pending', 'b-warn')),
+      h('td', null, h('span', { class: 'dot' + (d.is_online ? ' on' : '') }), d.is_online ? 'Online' : 'Offline'),
+      h('td', null, fmtDate(d.created_at)),
+      h('td', null, d.is_verified
+        ? h('button', { class: 'danger', onclick: () => setVerified(d, false) }, 'Suspend')
+        : h('button', { onclick: () => setVerified(d, true) }, 'Verify'))));
+
+    const body = rows.length
+      ? h('tbody', null, rows)
+      : h('tbody', null, h('tr', null, h('td', { colspan: '8', class: 'empty' }, 'No drivers registered yet.')));
+
+    $('driversTable').replaceChildren(head, body);
+  }
+
+  function renderBookings() {
+    const filter = $('statusFilter').value;
+    const list = bookings.filter((b) => filter === 'ALL' || b.status === filter);
+
+    const head = h('thead', null, h('tr', null,
+      ['Created', 'Passenger', 'Pickup', 'Destination', 'Fare', 'Status', 'Driver', 'Completed'].map((t) => h('th', null, t))));
+
+    const rows = list.map((b) => h('tr', null,
+      h('td', null, fmtDate(b.created_at)),
+      h('td', null, b.passenger_name || '-'),
+      h('td', null, b.pickup_name || '-'),
+      h('td', null, b.destination_name || '-'),
+      h('td', null, fmtFare(b.fare)),
+      h('td', null, statusBadge(b.status)),
+      h('td', null, b.driver_name ? b.driver_name + ' (#' + (b.driver_body_number || '-') + ')' : '-'),
+      h('td', null, fmtDate(b.completed_at))));
+
+    const body = rows.length
+      ? h('tbody', null, rows)
+      : h('tbody', null, h('tr', null, h('td', { colspan: '8', class: 'empty' }, 'No bookings found.')));
+
+    $('bookingsTable').replaceChildren(head, body);
+  }
+
+  function selectTab(name) {
+    const drivers = name === 'drivers';
+    $('panelDrivers').hidden = !drivers;
+    $('panelBookings').hidden = drivers;
+    $('tabDrivers').classList.toggle('active', drivers);
+    $('tabBookings').classList.toggle('active', !drivers);
+  }
+
+  function signIn() {
+    const key = $('keyInput').value.trim();
+    if (!key) { $('loginError').textContent = 'Enter the admin key.'; return; }
+    adminKey = key;
+    sessionStorage.setItem('adminKey', key);
+    $('keyInput').value = '';
+    $('loginError').textContent = '';
+    loadAll();
+  }
+
+  $('btnLogin').addEventListener('click', signIn);
+  $('keyInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') signIn(); });
+  $('btnRefresh').addEventListener('click', loadAll);
+  $('btnLogout').addEventListener('click', () => {
+    sessionStorage.removeItem('adminKey');
+    adminKey = '';
+    showLogin('');
+  });
+  $('tabDrivers').addEventListener('click', () => selectTab('drivers'));
+  $('tabBookings').addEventListener('click', () => selectTab('bookings'));
+  $('statusFilter').addEventListener('change', renderBookings);
+
+  if (adminKey) loadAll(); else showLogin('');
+})();
+</script>
+</body>
+</html>
