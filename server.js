@@ -8,7 +8,7 @@ const { Server } = require('socket.io');
 const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
-app.set('trust proxy', 1); // Render sits behind a proxy
+app.set('trust proxy', 1);
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 
@@ -16,10 +16,6 @@ const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 const PASSWORD_MESSAGE =
     'Password must be at least 12 characters long and include a number, capital letter, and special character (@#$%^&+=!_).';
@@ -31,7 +27,6 @@ const isValidPassword = (password) => {
 
 const hashPassword = (plain) => bcrypt.hash(plain, 10);
 
-// Supports old plain-text rows: compares directly, then upgrades the row to a hash
 async function verifyPassword(table, row, plain) {
     const stored = row.password || '';
     if (stored.startsWith('$2')) {
@@ -51,8 +46,6 @@ const stripPassword = (row) => {
     return safe;
 };
 
-// Admin access: header "x-admin-key" must match the ADMIN_KEY environment variable.
-// 10 wrong tries from one address blocks it for 15 minutes.
 const ADMIN_KEY = process.env.ADMIN_KEY || '';
 const adminFails = new Map();
 
@@ -84,16 +77,9 @@ function requireAdmin(req, res, next) {
     next();
 }
 
-// ---------------------------------------------------------------------------
-// Health check
-// ---------------------------------------------------------------------------
 app.get('/', (req, res) => {
     res.status(200).json({ success: true, message: 'Isabel-Xpress backend is running' });
 });
-
-// ---------------------------------------------------------------------------
-// Passenger
-// ---------------------------------------------------------------------------
 
 app.post('/register', async (req, res) => {
     try {
@@ -153,8 +139,6 @@ app.post('/login', async (req, res) => {
     }
 });
 
-// WARNING: anyone who knows an email can change that account's password.
-// Replace with an emailed-code flow before real users rely on this app.
 app.post('/reset-password-direct', async (req, res) => {
     try {
         const { email, newPassword } = req.body;
@@ -192,11 +176,6 @@ app.post('/reset-password-direct', async (req, res) => {
     }
 });
 
-// ---------------------------------------------------------------------------
-// Driver
-// ---------------------------------------------------------------------------
-
-// New drivers start unverified until the administrator approves them
 app.post('/driver-register', async (req, res) => {
     try {
         const { full_name, fullName, email, password, toda_body_number, bodyNumber } = req.body;
@@ -261,7 +240,6 @@ app.post('/driver-login', async (req, res) => {
             return res.status(401).json({ success: false, message: 'Invalid driver credentials' });
         }
 
-        // Checked after the password so the status is not revealed to strangers
         if (!data.is_verified) {
             return res.status(403).json({
                 success: false,
@@ -276,7 +254,6 @@ app.post('/driver-login', async (req, res) => {
     }
 });
 
-// WARNING: same takeover risk as the passenger route. Replace before release.
 app.post('/driver-reset-password', async (req, res) => {
     try {
         const { email, newPassword } = req.body;
@@ -314,7 +291,6 @@ app.post('/driver-reset-password', async (req, res) => {
     }
 });
 
-// Online/offline. Only verified drivers can go online.
 app.post('/driver-status', async (req, res) => {
     try {
         const { driverId, isOnline } = req.body;
@@ -350,25 +326,29 @@ app.post('/driver-status', async (req, res) => {
     }
 });
 
-// Online, verified drivers - public fields only
 app.get('/available-drivers', async (req, res) => {
     try {
         const { data, error } = await supabase
             .from('drivers')
-            .select('id, full_name, toda_body_number, is_online')
+            .select('id, full_name, toda_body_number, is_online, current_latitude, current_longitude, location_updated_at')
             .eq('is_online', true)
             .eq('is_verified', true);
 
         if (error) return res.status(400).json({ success: false, message: error.message });
-        res.status(200).json({ success: true, drivers: data });
+
+        const now = Date.now();
+        const drivers = (data || []).map((d) => ({
+            ...d,
+            location_age_seconds: d.location_updated_at
+                ? Math.round((now - new Date(d.location_updated_at).getTime()) / 1000)
+                : null
+        }));
+
+        res.status(200).json({ success: true, drivers });
     } catch (err) {
         res.status(500).json({ success: false, message: err.message });
     }
 });
-
-// ---------------------------------------------------------------------------
-// Landmarks and fare
-// ---------------------------------------------------------------------------
 
 app.get('/landmarks', async (req, res) => {
     try {
@@ -424,7 +404,7 @@ app.post('/calculate-fare', async (req, res) => {
         }
 
         const discounted = isDiscounted === true || isDiscounted === 'true';
-        const totalFare = discounted ? baseFare * 0.8 : baseFare; // 20% discount
+        const totalFare = discounted ? baseFare * 0.8 : baseFare;
 
         res.status(200).json({
             distanceKm: parseFloat(distanceKm.toFixed(2)),
@@ -437,10 +417,6 @@ app.post('/calculate-fare', async (req, res) => {
         res.status(500).json({ success: false, message: 'Server error: ' + err.message });
     }
 });
-
-// ---------------------------------------------------------------------------
-// Bookings (saved in the "bookings" table)
-// ---------------------------------------------------------------------------
 
 app.post('/bookings', async (req, res) => {
     try {
@@ -493,7 +469,6 @@ app.post('/bookings', async (req, res) => {
     }
 });
 
-// Order matters: /available and /active must come before /:id
 app.get('/bookings/available', async (req, res) => {
     try {
         const { data, error } = await supabase
@@ -549,7 +524,6 @@ app.get('/bookings/:id', async (req, res) => {
     }
 });
 
-// Driver accepts a booking (verified drivers only)
 app.post('/bookings/:id/accept', async (req, res) => {
     try {
         const { driverId } = req.body;
@@ -581,7 +555,6 @@ app.post('/bookings/:id/accept', async (req, res) => {
             return res.status(409).json({ success: false, message: 'Finish your current trip first.' });
         }
 
-        // Only succeeds if the booking is still PENDING, so two drivers can't take it
         const { data, error } = await supabase
             .from('bookings')
             .update({
@@ -643,10 +616,6 @@ app.post('/bookings/:id/complete', async (req, res) => {
     }
 });
 
-// ---------------------------------------------------------------------------
-// Admin (page + API). The page is public, but every API call needs ADMIN_KEY.
-// ---------------------------------------------------------------------------
-
 app.get('/admin', (req, res) => {
     res.set('Cache-Control', 'no-store');
     res.sendFile(path.join(__dirname, 'admin.html'));
@@ -666,7 +635,6 @@ app.get('/admin/api/drivers', requireAdmin, async (req, res) => {
     }
 });
 
-// Body: { "verified": true } to approve, { "verified": false } to suspend
 app.post('/admin/api/drivers/:id/verify', requireAdmin, async (req, res) => {
     try {
         const verified = req.body.verified === true;
@@ -707,9 +675,27 @@ app.get('/admin/api/bookings', requireAdmin, async (req, res) => {
     }
 });
 
-// ---------------------------------------------------------------------------
-// Socket.IO (live notifications; the database is the source of truth)
-// ---------------------------------------------------------------------------
+const driverSockets = new Map();
+const lastLocationWrite = new Map();
+
+async function markDriverOffline(socket) {
+    try {
+        const driverId = socket.data.driverId;
+        if (!driverId) return;
+        socket.data.driverId = null;
+        socket.data.driverInfo = null;
+
+        if (driverSockets.get(driverId) !== socket.id) return;
+        driverSockets.delete(driverId);
+
+        const { error } = await supabase.from('drivers').update({ is_online: false }).eq('id', driverId);
+        if (error) console.error('MARK OFFLINE ERROR:', error);
+
+        io.emit('driver_offline', { driverId });
+    } catch (err) {
+        console.error('MARK OFFLINE CRASH:', err);
+    }
+}
 
 io.on('connection', (socket) => {
     console.log('Socket connected:', socket.id);
@@ -724,17 +710,76 @@ io.on('connection', (socket) => {
         if (d && d.bookingId) socket.join(`booking:${d.bookingId}`);
     });
 
-    // Chat goes only to the other person in the same booking
     socket.on('chat_message', (d) => {
         if (d && d.bookingId) socket.to(`booking:${d.bookingId}`).emit('chat_message', d);
     });
 
-    socket.on('location_changed', (data) => {
-        socket.broadcast.emit('location_changed', data);
+    socket.on('driver_online', async (d) => {
+        try {
+            const driverId = d && d.driverId;
+            if (!driverId) return;
+
+            const { data: driver } = await supabase
+                .from('drivers')
+                .select('id, full_name, toda_body_number, is_verified')
+                .eq('id', driverId)
+                .maybeSingle();
+
+            if (!driver || !driver.is_verified) return;
+
+            socket.data.driverId = driver.id;
+            socket.data.driverInfo = { fullName: driver.full_name, bodyNumber: driver.toda_body_number };
+            driverSockets.set(driver.id, socket.id);
+
+            await supabase.from('drivers').update({ is_online: true }).eq('id', driver.id);
+        } catch (err) {
+            console.error('DRIVER ONLINE ERROR:', err);
+        }
+    });
+
+    socket.on('driver_offline', () => { markDriverOffline(socket); });
+
+    socket.on('location_changed', async (d) => {
+        try {
+            const driverId = socket.data.driverId;
+            const info = socket.data.driverInfo;
+            if (!driverId || !info || !d) return;
+
+            const lat = d.latitude;
+            const lng = d.longitude;
+            if (typeof lat !== 'number' || typeof lng !== 'number' ||
+                !Number.isFinite(lat) || !Number.isFinite(lng) ||
+                Math.abs(lat) > 90 || Math.abs(lng) > 180) return;
+
+            socket.broadcast.emit('location_changed', {
+                driverId,
+                fullName: info.fullName,
+                bodyNumber: info.bodyNumber,
+                latitude: lat,
+                longitude: lng
+            });
+
+            const now = Date.now();
+            if (now - (lastLocationWrite.get(driverId) || 0) >= 10000) {
+                lastLocationWrite.set(driverId, now);
+                const { error } = await supabase
+                    .from('drivers')
+                    .update({
+                        current_latitude: lat,
+                        current_longitude: lng,
+                        location_updated_at: new Date().toISOString()
+                    })
+                    .eq('id', driverId);
+                if (error) console.error('LOCATION SAVE ERROR:', error);
+            }
+        } catch (err) {
+            console.error('LOCATION ERROR:', err);
+        }
     });
 
     socket.on('disconnect', () => {
         console.log('Socket disconnected:', socket.id);
+        markDriverOffline(socket);
     });
 });
 
