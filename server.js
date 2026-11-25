@@ -11,7 +11,9 @@ const app = express();
 app.set('trust proxy', 1);
 app.disable('x-powered-by');
 app.use(express.urlencoded({ extended: true, limit: '20kb' }));
-app.use(express.json({ limit: '20kb' }));
+const smallJson = express.json({ limit: '20kb' });
+const photoJson = express.json({ limit: '250kb' });   // only the driver photo upload may be larger
+app.use((req, res, next) => (req.path === '/driver/profile' ? photoJson : smallJson)(req, res, next));
 
 app.use((req, res, next) => {
     res.set('X-Content-Type-Options', 'nosniff');
@@ -83,10 +85,10 @@ const isEmail = (e) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e) && e.length <= 254;
 // ---------------------------------------------------------------------------
 const b64url = (buf) => Buffer.from(buf).toString('base64url');
 
-function signToken(payload) {
+function signToken(payload, ttlSeconds = TOKEN_TTL_SECONDS) {
     const header = b64url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
     const now = Math.floor(Date.now() / 1000);
-    const body = b64url(JSON.stringify({ ...payload, iat: now, exp: now + TOKEN_TTL_SECONDS }));
+    const body = b64url(JSON.stringify({ ...payload, iat: now, exp: now + ttlSeconds }));
     const sig = crypto.createHmac('sha256', JWT_SECRET).update(`${header}.${body}`).digest('base64url');
     return `${header}.${body}.${sig}`;
 }
@@ -118,7 +120,7 @@ function requireAuth(role) {
         const token = header.startsWith('Bearer ') ? header.slice(7) : '';
         const payload = verifyToken(token);
 
-        if (!payload) {
+        if (!payload || !['passenger', 'driver'].includes(payload.role)) {
             return res.status(401).json({ success: false, message: 'Please log in again.' });
         }
         if (role && payload.role !== role) {
@@ -220,7 +222,7 @@ function computeFare(origin, destination, discounted) {
 // ---------------------------------------------------------------------------
 // Email (Brevo HTTPS API, because Render's free tier blocks SMTP)
 // ---------------------------------------------------------------------------
-async function sendResetEmail(toEmail, code) {
+async function sendResetEmail(toEmail, code, purpose = 'reset') {
     if (!BREVO_API_KEY || !MAIL_FROM) {
         console.error('EMAIL NOT CONFIGURED: set BREVO_API_KEY and MAIL_FROM on Render.');
         return false;
@@ -233,11 +235,11 @@ async function sendResetEmail(toEmail, code) {
             body: JSON.stringify({
                 sender: { name: MAIL_FROM_NAME, email: MAIL_FROM },
                 to: [{ email: toEmail }],
-                subject: 'Your Isabel-Xpress password reset code',
+                subject: purpose === 'verify' ? 'Verify your Isabel-Xpress email' : 'Your Isabel-Xpress password reset code',
                 htmlContent:
-                    `<p>Your Isabel-Xpress password reset code is:</p>` +
+                    `<p>${purpose === 'verify' ? 'Welcome to Isabel-Xpress! Your email verification code is:' : 'Your Isabel-Xpress password reset code is:'}</p>` +
                     `<p style="font-size:28px;font-weight:bold;letter-spacing:6px">${code}</p>` +
-                    `<p>It expires in ${RESET_CODE_MINUTES} minutes. If you did not ask for this, ignore this email; your password has not changed.</p>`
+                    `<p>It expires in ${RESET_CODE_MINUTES} minutes. If you did not ask for this, ignore this email.</p>`
             })
         });
 
@@ -253,6 +255,52 @@ async function sendResetEmail(toEmail, code) {
 }
 
 const tableFor = (role) => (role === 'driver' ? 'drivers' : 'passengers');
+
+// Creates a one-time 6-digit code (stored hashed) and returns it, or null if it could not be saved
+async function issueCode(email, role, purpose) {
+    const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
+
+    await supabase.from('password_resets').update({ used: true })
+        .eq('email', email).eq('role', role).eq('purpose', purpose).eq('used', false);
+
+    const { error } = await supabase.from('password_resets').insert([{
+        role,
+        email,
+        purpose,
+        code_hash: await bcrypt.hash(code, 8),
+        expires_at: new Date(Date.now() + RESET_CODE_MINUTES * 60 * 1000).toISOString()
+    }]);
+
+    if (error) {
+        console.error('CODE INSERT ERROR:', error);
+        return null;
+    }
+    return code;
+}
+
+// Returns true only when the code is right, unused, unexpired and not over the attempt limit
+async function consumeCode(email, role, purpose, code) {
+    const { data: rows } = await supabase
+        .from('password_resets').select('*')
+        .eq('email', email).eq('role', role).eq('purpose', purpose).eq('used', false)
+        .order('created_at', { ascending: false }).limit(1);
+
+    const row = rows && rows[0];
+    if (!row || new Date(row.expires_at).getTime() < Date.now() || row.attempts >= RESET_MAX_ATTEMPTS) return false;
+
+    if (!(await bcrypt.compare(code, row.code_hash))) {
+        await supabase.from('password_resets').update({ attempts: row.attempts + 1 }).eq('id', row.id);
+        return false;
+    }
+
+    await supabase.from('password_resets').update({ used: true }).eq('id', row.id);
+    return true;
+}
+
+function logAdmin(action, detail) {
+    supabase.from('admin_logs').insert([{ action, detail: String(detail || '').slice(0, 300) }])
+        .then(({ error }) => { if (error) console.error('ADMIN LOG ERROR:', error.message); });
+}
 
 // ---------------------------------------------------------------------------
 // Public routes
@@ -282,14 +330,22 @@ app.post('/register', rateLimit('register', 10, 60 * 60 * 1000), async (req, res
 
         const { error } = await supabase
             .from('passengers')
-            .insert([{ full_name: nameToSave, email, password: await hashPassword(password) }]);
+            .insert([{ full_name: nameToSave, email, password: await hashPassword(password), email_verified: false }]);
 
         if (error) {
             console.error('PASSENGER INSERT ERROR:', error);
             return res.status(400).json({ success: false, message: 'Could not register. This email may already be in use.' });
         }
 
-        res.status(200).json({ success: true, message: 'User registered successfully!' });
+        const code = await issueCode(email, 'passenger', 'verify');
+        const sent = code ? await sendResetEmail(email, code, 'verify') : false;
+        res.status(200).json({
+            success: true,
+            needsVerification: true,
+            message: sent
+                ? 'Registered! We sent a 6-digit code to your email.'
+                : 'Registered, but the code email could not be sent. Tap "Resend code" on the next screen.'
+        });
     } catch (err) {
         console.error('PASSENGER REGISTER ERROR:', err);
         res.status(500).json({ success: false, message: 'Server error.' });
@@ -317,6 +373,14 @@ app.post('/login', rateLimit('login', 20, 15 * 60 * 1000), async (req, res) => {
 
         if (!data || !(await verifyPassword('passengers', data, password))) {
             return res.status(401).json({ success: false, message: 'Invalid credentials' });
+        }
+
+        if (data.email_verified === false) {
+            return res.status(403).json({
+                success: false,
+                needsVerification: true,
+                message: 'Please verify your email first. Enter the 6-digit code we sent you.'
+            });
         }
 
         const token = signToken({ sub: data.id, role: 'passenger', name: data.full_name });
@@ -355,7 +419,8 @@ app.post('/driver-register', rateLimit('driver-register', 10, 60 * 60 * 1000), a
                 password: await hashPassword(password),
                 toda_body_number: bodyToSave,
                 is_online: false,
-                is_verified: false
+                is_verified: false,
+                email_verified: false
             }])
             .select();
 
@@ -364,9 +429,15 @@ app.post('/driver-register', rateLimit('driver-register', 10, 60 * 60 * 1000), a
             return res.status(400).json({ success: false, message: 'Could not register. This email may already be in use.' });
         }
 
+        const code = await issueCode(email, 'driver', 'verify');
+        const sent = code ? await sendResetEmail(email, code, 'verify') : false;
         res.status(200).json({
             success: true,
-            message: 'Registration received. You can log in after the administrator verifies your TODA details.',
+            needsVerification: true,
+            message: (sent
+                ? 'Registered! We sent a 6-digit code to your email. '
+                : 'Registered, but the code email could not be sent. Tap "Resend code" on the next screen. ') +
+                'You can log in after you verify your email and the administrator verifies your TODA details.',
             user: stripPassword(data[0])
         });
     } catch (err) {
@@ -396,6 +467,14 @@ app.post('/driver-login', rateLimit('driver-login', 20, 15 * 60 * 1000), async (
 
         if (!data || !(await verifyPassword('drivers', data, password))) {
             return res.status(401).json({ success: false, message: 'Invalid driver credentials' });
+        }
+
+        if (data.email_verified === false) {
+            return res.status(403).json({
+                success: false,
+                needsVerification: true,
+                message: 'Please verify your email first. Enter the 6-digit code we sent you.'
+            });
         }
 
         if (!data.is_verified) {
@@ -436,6 +515,7 @@ app.post('/forgot-password', rateLimit('forgot', 5, 15 * 60 * 1000), async (req,
             .select('created_at')
             .eq('email', email)
             .eq('role', role)
+            .eq('purpose', 'reset')
             .order('created_at', { ascending: false })
             .limit(1);
 
@@ -445,11 +525,12 @@ app.post('/forgot-password', rateLimit('forgot', 5, 15 * 60 * 1000), async (req,
 
         const code = String(crypto.randomInt(0, 1000000)).padStart(6, '0');
 
-        await supabase.from('password_resets').update({ used: true }).eq('email', email).eq('role', role).eq('used', false);
+        await supabase.from('password_resets').update({ used: true }).eq('email', email).eq('role', role).eq('purpose', 'reset').eq('used', false);
 
         const { error } = await supabase.from('password_resets').insert([{
             role,
             email,
+            purpose: 'reset',
             code_hash: await bcrypt.hash(code, 8),
             expires_at: new Date(Date.now() + RESET_CODE_MINUTES * 60 * 1000).toISOString()
         }]);
@@ -492,6 +573,7 @@ app.post('/reset-password', rateLimit('reset', 15, 15 * 60 * 1000), async (req, 
             .select('*')
             .eq('email', email)
             .eq('role', role)
+            .eq('purpose', 'reset')
             .eq('used', false)
             .order('created_at', { ascending: false })
             .limit(1);
@@ -522,6 +604,63 @@ app.post('/reset-password', rateLimit('reset', 15, 15 * 60 * 1000), async (req, 
         res.status(200).json({ success: true, message: 'Password updated. You can now log in.' });
     } catch (err) {
         console.error('RESET ERROR:', err);
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
+// ---- Email verification after registration ----
+
+app.post('/send-verification', rateLimit('sendverify', 5, 15 * 60 * 1000), async (req, res) => {
+    const generic = { success: true, message: 'If this email needs verification, a new code has been sent.' };
+    try {
+        const email = normalizeEmail(req.body.email);
+        const role = req.body.role === 'driver' ? 'driver' : 'passenger';
+        if (!isEmail(email)) {
+            return res.status(400).json({ success: false, message: 'Please enter a valid email address.' });
+        }
+
+        const { data: user } = await supabase.from(tableFor(role)).select('id, email_verified').eq('email', email).maybeSingle();
+        if (!user || user.email_verified !== false) return res.status(200).json(generic);
+
+        const { data: recent } = await supabase
+            .from('password_resets').select('created_at')
+            .eq('email', email).eq('role', role).eq('purpose', 'verify')
+            .order('created_at', { ascending: false }).limit(1);
+        if (recent && recent.length && Date.now() - new Date(recent[0].created_at).getTime() < 60 * 1000) {
+            return res.status(200).json(generic);
+        }
+
+        const code = await issueCode(email, role, 'verify');
+        if (!code || !(await sendResetEmail(email, code, 'verify'))) {
+            return res.status(500).json({ success: false, message: 'Could not send the email right now. Please try again later.' });
+        }
+        res.status(200).json(generic);
+    } catch (err) {
+        console.error('SEND VERIFY ERROR:', err);
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
+app.post('/verify-email', rateLimit('verifyemail', 15, 15 * 60 * 1000), async (req, res) => {
+    try {
+        const email = normalizeEmail(req.body.email);
+        const role = req.body.role === 'driver' ? 'driver' : 'passenger';
+        const code = String(req.body.code || '').trim();
+
+        if (!isEmail(email) || !/^\d{6}$/.test(code)) {
+            return res.status(400).json({ success: false, message: 'Enter your email and the 6-digit code.' });
+        }
+
+        if (!(await consumeCode(email, role, 'verify', code))) {
+            return res.status(400).json({ success: false, message: 'The code is wrong or has expired. Request a new one.' });
+        }
+
+        const { error } = await supabase.from(tableFor(role)).update({ email_verified: true }).eq('email', email);
+        if (error) return res.status(500).json({ success: false, message: 'Could not verify. Please try again.' });
+
+        res.status(200).json({ success: true, message: 'Email verified. You can now log in.' });
+    } catch (err) {
+        console.error('VERIFY EMAIL ERROR:', err);
         res.status(500).json({ success: false, message: 'Server error.' });
     }
 });
@@ -972,6 +1111,179 @@ app.post('/reports', requireAuth('passenger'), rateLimit('report', 10, 60 * 60 *
     }
 });
 
+// ---- Driver profile, photo, QR code ----
+
+// What a passenger may know about a driver. The photo is shown only after the administrator approved it.
+async function driverPublicProfile(driverId) {
+    const { data: d } = await supabase
+        .from('drivers')
+        .select('id, full_name, toda_body_number, vehicle_model, plate_number, photo, photo_status, is_verified')
+        .eq('id', driverId).maybeSingle();
+    if (!d) return null;
+
+    const { data: rated } = await supabase
+        .from('bookings').select('rating').eq('driver_id', driverId).not('rating', 'is', null);
+    const { count } = await supabase
+        .from('bookings').select('id', { count: 'exact', head: true }).eq('driver_id', driverId).eq('status', 'COMPLETED');
+
+    const n = (rated || []).length;
+    const total = (rated || []).reduce((sum, r) => sum + r.rating, 0);
+
+    return {
+        id: d.id,
+        full_name: d.full_name,
+        toda_body_number: d.toda_body_number,
+        vehicle_model: d.vehicle_model,
+        plate_number: d.plate_number,
+        is_verified: d.is_verified === true,
+        photo_status: d.photo_status,
+        photo: d.photo_status === 'APPROVED' ? d.photo : null,
+        avg_rating: n ? parseFloat((total / n).toFixed(2)) : null,
+        rating_count: n,
+        trips: count || 0
+    };
+}
+
+app.get('/drivers/:id/profile', requireAuth('passenger'), async (req, res) => {
+    try {
+        const profile = await driverPublicProfile(req.params.id);
+        if (!profile) return res.status(404).json({ success: false, message: 'Driver not found.' });
+        res.status(200).json({ success: true, driver: profile });
+    } catch (err) {
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
+// The driver's own profile, including their photo even while it waits for approval
+app.get('/driver/me', requireAuth('driver'), async (req, res) => {
+    try {
+        const profile = await driverPublicProfile(req.auth.sub);
+        if (!profile) return res.status(404).json({ success: false, message: 'Driver not found.' });
+
+        const { data: own } = await supabase.from('drivers').select('photo').eq('id', req.auth.sub).maybeSingle();
+        res.status(200).json({ success: true, driver: { ...profile, photo: own ? own.photo : null } });
+    } catch (err) {
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
+app.post('/driver/profile', requireAuth('driver'), rateLimit('driverprofile', 20, 60 * 60 * 1000), async (req, res) => {
+    try {
+        const update = {};
+
+        if (req.body.plate_number !== undefined) {
+            update.plate_number = cleanText(req.body.plate_number, 12).toUpperCase() || null;
+        }
+
+        if (req.body.photo) {
+            const photo = String(req.body.photo);
+            const m = /^data:image\/jpeg;base64,([A-Za-z0-9+/=]+)$/.exec(photo);
+            if (!m || photo.length > 200000) {
+                return res.status(400).json({ success: false, message: 'The photo must be a small JPEG image.' });
+            }
+            const bytes = Buffer.from(m[1], 'base64');
+            if (bytes.length < 1000 || bytes[0] !== 0xff || bytes[1] !== 0xd8) {
+                return res.status(400).json({ success: false, message: 'That file is not a valid JPEG photo.' });
+            }
+            update.photo = photo;
+            update.photo_status = 'PENDING';
+        }
+
+        if (Object.keys(update).length === 0) {
+            return res.status(400).json({ success: false, message: 'Nothing to save.' });
+        }
+
+        const { error } = await supabase.from('drivers').update(update).eq('id', req.auth.sub);
+        if (error) return res.status(400).json({ success: false, message: 'Could not save your profile.' });
+
+        res.status(200).json({
+            success: true,
+            message: update.photo ? 'Saved. Your photo is waiting for administrator approval.' : 'Saved.'
+        });
+    } catch (err) {
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
+// A QR code that lasts 5 minutes. A passenger scans it to confirm who the driver really is.
+app.get('/driver/qr', requireAuth('driver'), async (req, res) => {
+    try {
+        const { data: driver } = await supabase.from('drivers').select('is_verified').eq('id', req.auth.sub).maybeSingle();
+        if (!driver || !driver.is_verified) {
+            return res.status(403).json({ success: false, message: 'Your account is not verified.' });
+        }
+        const token = signToken({ sub: req.auth.sub, role: 'qr' }, 300);
+        res.status(200).json({ success: true, code: 'ISABEL:' + token, expires_in: 300 });
+    } catch (err) {
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
+app.post('/verify-driver', requireAuth('passenger'), rateLimit('verifyqr', 60, 60 * 60 * 1000), async (req, res) => {
+    try {
+        const raw = String(req.body.code || '');
+        if (!raw.startsWith('ISABEL:')) {
+            return res.status(400).json({ success: false, message: 'This is not an Isabel-Xpress driver QR code.' });
+        }
+
+        const payload = verifyToken(raw.slice(7));
+        if (!payload || payload.role !== 'qr') {
+            return res.status(400).json({ success: false, message: 'This QR code is invalid or expired. Ask the driver to refresh it.' });
+        }
+
+        const profile = await driverPublicProfile(payload.sub);
+        if (!profile) return res.status(404).json({ success: false, message: 'Driver not found.' });
+
+        res.status(200).json({ success: true, driver: profile });
+    } catch (err) {
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
+// ---- Driver earnings (cash trips, Philippine time) ----
+
+app.get('/my/earnings', requireAuth('driver'), async (req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('bookings').select('fare, completed_at')
+            .eq('driver_id', req.auth.sub).eq('status', 'COMPLETED').limit(5000);
+        if (error) return res.status(400).json({ success: false, message: 'Could not load earnings.' });
+
+        const offset = 8 * 60 * 60 * 1000;                        // UTC+8
+        const nowPh = new Date(Date.now() + offset);
+        const dayStart = Date.UTC(nowPh.getUTCFullYear(), nowPh.getUTCMonth(), nowPh.getUTCDate()) - offset;
+        const weekStart = dayStart - ((nowPh.getUTCDay() + 6) % 7) * 24 * 60 * 60 * 1000;   // Monday
+
+        const out = { today_trips: 0, today_total: 0, week_trips: 0, week_total: 0, all_trips: 0, all_total: 0 };
+        for (const b of data || []) {
+            const fare = Number(b.fare) || 0;
+            const t = b.completed_at ? new Date(b.completed_at).getTime() : 0;
+            out.all_trips += 1; out.all_total += fare;
+            if (t >= weekStart) { out.week_trips += 1; out.week_total += fare; }
+            if (t >= dayStart) { out.today_trips += 1; out.today_total += fare; }
+        }
+        for (const k of ['today_total', 'week_total', 'all_total']) out[k] = parseFloat(out[k].toFixed(2));
+
+        res.status(200).json({ success: true, earnings: out });
+    } catch (err) {
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
+// ---- Announcements ----
+
+app.get('/announcements/latest', requireAuth(), async (req, res) => {
+    try {
+        const since = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+        const { data } = await supabase
+            .from('announcements').select('id, message, created_at')
+            .gte('created_at', since).order('created_at', { ascending: false }).limit(1);
+        res.status(200).json({ success: true, announcement: data && data.length ? data[0] : null });
+    } catch (err) {
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
 // ---------------------------------------------------------------------------
 // Administrator
 // ---------------------------------------------------------------------------
@@ -984,7 +1296,7 @@ app.get('/admin/api/drivers', requireAdmin, async (req, res) => {
     try {
         const { data, error } = await supabase
             .from('drivers')
-            .select('id, full_name, email, toda_body_number, vehicle_model, is_online, is_verified, verified_at, created_at')
+            .select('id, full_name, email, toda_body_number, vehicle_model, plate_number, photo_status, email_verified, is_online, is_verified, verified_at, created_at')
             .order('created_at', { ascending: false });
 
         if (error) return res.status(400).json({ success: false, message: error.message });
@@ -1035,6 +1347,7 @@ app.post('/admin/api/drivers/:id/verify', requireAdmin, async (req, res) => {
             return res.status(404).json({ success: false, message: 'Driver not found.' });
         }
 
+        logAdmin(verified ? 'DRIVER_VERIFIED' : 'DRIVER_SUSPENDED', data[0].full_name);
         res.status(200).json({ success: true, message: verified ? 'Driver verified' : 'Driver suspended', driver: data[0] });
     } catch (err) {
         res.status(500).json({ success: false, message: 'Server error.' });
@@ -1098,8 +1411,317 @@ app.post('/admin/api/reports/:id/resolve', requireAdmin, async (req, res) => {
 
         if (error) return res.status(400).json({ success: false, message: error.message });
         if (!data || data.length === 0) return res.status(404).json({ success: false, message: 'Report not found.' });
+        logAdmin('REPORT_RESOLVED', req.params.id);
         res.status(200).json({ success: true, message: 'Report marked as resolved' });
     } catch (err) {
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
+// ---- Admin: edit / delete drivers and passengers ----
+
+const cleanText = (v, max) => String(v === undefined || v === null ? '' : v).trim().slice(0, max);
+
+app.patch('/admin/api/drivers/:id', requireAdmin, async (req, res) => {
+    try {
+        const update = {};
+
+        if (req.body.full_name !== undefined) {
+            const v = cleanText(req.body.full_name, 100);
+            if (!v) return res.status(400).json({ success: false, message: 'Name cannot be empty.' });
+            update.full_name = v;
+        }
+        if (req.body.email !== undefined) {
+            const v = normalizeEmail(req.body.email);
+            if (!isEmail(v)) return res.status(400).json({ success: false, message: 'Enter a valid email address.' });
+            update.email = v;
+        }
+        if (req.body.toda_body_number !== undefined) {
+            const v = cleanText(req.body.toda_body_number, 20);
+            if (!v) return res.status(400).json({ success: false, message: 'Body number cannot be empty.' });
+            update.toda_body_number = v;
+        }
+        if (req.body.vehicle_model !== undefined) {
+            update.vehicle_model = cleanText(req.body.vehicle_model, 60) || null;
+        }
+        if (Object.keys(update).length === 0) {
+            return res.status(400).json({ success: false, message: 'Nothing to update.' });
+        }
+
+        const { data, error } = await supabase
+            .from('drivers').update(update).eq('id', req.params.id)
+            .select('id, full_name, email, toda_body_number, vehicle_model');
+
+        if (error) return res.status(400).json({ success: false, message: 'Could not save. That email may already be used.' });
+        if (!data || data.length === 0) return res.status(404).json({ success: false, message: 'Driver not found.' });
+        logAdmin('DRIVER_EDITED', data[0].full_name + ' (' + Object.keys(update).join(', ') + ')');
+        res.status(200).json({ success: true, message: 'Driver updated', driver: data[0] });
+    } catch (err) {
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
+app.delete('/admin/api/drivers/:id', requireAdmin, async (req, res) => {
+    try {
+        const { data: active } = await supabase
+            .from('bookings').select('id').eq('driver_id', req.params.id).eq('status', 'ACCEPTED').limit(1);
+        if (active && active.length > 0) {
+            return res.status(409).json({ success: false, message: 'This driver is on a trip. Cancel that booking first.' });
+        }
+
+        const { data, error } = await supabase.from('drivers').delete().eq('id', req.params.id).select('id');
+
+        if (error) {
+            return res.status(409).json({ success: false, message: 'This driver has trip or report records and cannot be deleted. Use Suspend instead.' });
+        }
+        if (!data || data.length === 0) return res.status(404).json({ success: false, message: 'Driver not found.' });
+
+        driverSockets.delete(req.params.id);
+        io.emit('driver_offline', { driverId: req.params.id });
+        logAdmin('DRIVER_DELETED', req.params.id);
+        res.status(200).json({ success: true, message: 'Driver deleted' });
+    } catch (err) {
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
+app.get('/admin/api/passengers', requireAdmin, async (req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('passengers').select('id, full_name, email, email_verified, created_at').order('created_at', { ascending: false });
+        if (error) return res.status(400).json({ success: false, message: error.message });
+        res.status(200).json({ success: true, passengers: data });
+    } catch (err) {
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
+app.patch('/admin/api/passengers/:id', requireAdmin, async (req, res) => {
+    try {
+        const update = {};
+
+        if (req.body.full_name !== undefined) {
+            const v = cleanText(req.body.full_name, 100);
+            if (!v) return res.status(400).json({ success: false, message: 'Name cannot be empty.' });
+            update.full_name = v;
+        }
+        if (req.body.email !== undefined) {
+            const v = normalizeEmail(req.body.email);
+            if (!isEmail(v)) return res.status(400).json({ success: false, message: 'Enter a valid email address.' });
+            update.email = v;
+        }
+        if (Object.keys(update).length === 0) {
+            return res.status(400).json({ success: false, message: 'Nothing to update.' });
+        }
+
+        const { data, error } = await supabase
+            .from('passengers').update(update).eq('id', req.params.id).select('id, full_name, email');
+
+        if (error) return res.status(400).json({ success: false, message: 'Could not save. That email may already be used.' });
+        if (!data || data.length === 0) return res.status(404).json({ success: false, message: 'Passenger not found.' });
+        logAdmin('PASSENGER_EDITED', data[0].full_name + ' (' + Object.keys(update).join(', ') + ')');
+        res.status(200).json({ success: true, message: 'Passenger updated', passenger: data[0] });
+    } catch (err) {
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
+app.delete('/admin/api/passengers/:id', requireAdmin, async (req, res) => {
+    try {
+        const { data: active } = await supabase
+            .from('bookings').select('id').eq('passenger_id', req.params.id).in('status', ['PENDING', 'ACCEPTED']).limit(1);
+        if (active && active.length > 0) {
+            return res.status(409).json({ success: false, message: 'This passenger has an active booking. Cancel it first.' });
+        }
+
+        const { data, error } = await supabase.from('passengers').delete().eq('id', req.params.id).select('id');
+
+        if (error) {
+            return res.status(409).json({ success: false, message: 'This passenger has trip or report records and cannot be deleted.' });
+        }
+        if (!data || data.length === 0) return res.status(404).json({ success: false, message: 'Passenger not found.' });
+        logAdmin('PASSENGER_DELETED', req.params.id);
+        res.status(200).json({ success: true, message: 'Passenger deleted' });
+    } catch (err) {
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
+// Cancel a booking that is stuck (for example a driver's phone died mid-trip)
+app.post('/admin/api/bookings/:id/cancel', requireAdmin, async (req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('bookings')
+            .update({ status: 'CANCELLED', cancelled_at: new Date().toISOString() })
+            .eq('id', req.params.id)
+            .in('status', ['PENDING', 'ACCEPTED'])
+            .select();
+
+        if (error) return res.status(400).json({ success: false, message: 'Could not cancel the booking.' });
+        if (!data || data.length === 0) {
+            return res.status(409).json({ success: false, message: 'Only waiting or in-progress bookings can be cancelled.' });
+        }
+
+        const b = data[0];
+        io.to(`booking:${b.id}`).emit('booking_cancelled', { id: b.id });
+        io.to(`passenger:${b.passenger_id}`).emit('booking_cancelled', { id: b.id });
+        io.to('drivers').emit('booking_taken', { id: b.id });
+        logAdmin('BOOKING_CANCELLED', (b.passenger_name || '') + ': ' + (b.pickup_name || '') + ' to ' + (b.destination_name || ''));
+        res.status(200).json({ success: true, message: 'Booking cancelled' });
+    } catch (err) {
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
+app.delete('/admin/api/reports/:id', requireAdmin, async (req, res) => {
+    try {
+        const { data, error } = await supabase.from('reports').delete().eq('id', req.params.id).select('id');
+        if (error) return res.status(400).json({ success: false, message: 'Could not delete the report.' });
+        if (!data || data.length === 0) return res.status(404).json({ success: false, message: 'Report not found.' });
+        logAdmin('REPORT_DELETED', req.params.id);
+        res.status(200).json({ success: true, message: 'Report deleted' });
+    } catch (err) {
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
+// ---- Admin: driver photo review ----
+
+app.get('/admin/api/drivers/:id/photo', requireAdmin, async (req, res) => {
+    try {
+        const { data } = await supabase
+            .from('drivers').select('full_name, plate_number, photo, photo_status').eq('id', req.params.id).maybeSingle();
+        if (!data) return res.status(404).json({ success: false, message: 'Driver not found.' });
+        res.status(200).json({ success: true, driver: data });
+    } catch (err) {
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
+app.post('/admin/api/drivers/:id/photo-review', requireAdmin, async (req, res) => {
+    try {
+        const approve = req.body.approve === true;
+        const { data, error } = await supabase
+            .from('drivers').update({ photo_status: approve ? 'APPROVED' : 'REJECTED' })
+            .eq('id', req.params.id).not('photo', 'is', null).select('full_name');
+        if (error) return res.status(400).json({ success: false, message: 'Could not save the review.' });
+        if (!data || data.length === 0) return res.status(404).json({ success: false, message: 'This driver has no photo.' });
+        logAdmin(approve ? 'PHOTO_APPROVED' : 'PHOTO_REJECTED', data[0].full_name);
+        res.status(200).json({ success: true, message: approve ? 'Photo approved' : 'Photo rejected' });
+    } catch (err) {
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
+// ---- Admin: announcements to drivers ----
+
+app.get('/admin/api/announcements', requireAdmin, async (req, res) => {
+    try {
+        const { data } = await supabase
+            .from('announcements').select('*').order('created_at', { ascending: false }).limit(30);
+        res.status(200).json({ success: true, announcements: data || [] });
+    } catch (err) {
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
+app.post('/admin/api/announcements', requireAdmin, async (req, res) => {
+    try {
+        const message = cleanText(req.body.message, 200);
+        if (!message) return res.status(400).json({ success: false, message: 'Type a message first.' });
+
+        const { error } = await supabase.from('announcements').insert([{ message }]);
+        if (error) return res.status(400).json({ success: false, message: 'Could not save the announcement.' });
+
+        io.to('drivers').emit('announcement', { message });
+        logAdmin('ANNOUNCEMENT', message);
+        res.status(200).json({ success: true, message: 'Sent to all online drivers' });
+    } catch (err) {
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
+app.delete('/admin/api/announcements/:id', requireAdmin, async (req, res) => {
+    try {
+        const { error } = await supabase.from('announcements').delete().eq('id', req.params.id);
+        if (error) return res.status(400).json({ success: false, message: 'Could not delete.' });
+        res.status(200).json({ success: true, message: 'Announcement deleted' });
+    } catch (err) {
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
+// ---- Admin: activity log and dashboard numbers ----
+
+app.get('/admin/api/logs', requireAdmin, async (req, res) => {
+    try {
+        const { data } = await supabase
+            .from('admin_logs').select('*').order('created_at', { ascending: false }).limit(200);
+        res.status(200).json({ success: true, logs: data || [] });
+    } catch (err) {
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
+app.get('/admin/api/stats', requireAdmin, async (req, res) => {
+    try {
+        const { data: rows, error } = await supabase
+            .from('bookings')
+            .select('status, fare, pickup_name, destination_name, driver_id, driver_name, rating, created_at')
+            .order('created_at', { ascending: false }).limit(3000);
+        if (error) return res.status(400).json({ success: false, message: error.message });
+
+        const offset = 8 * 60 * 60 * 1000;
+        const dayKey = (iso) => new Date(new Date(iso).getTime() + offset).toISOString().slice(0, 10);
+
+        // Last 14 days (Philippine time), oldest first
+        const days = [];
+        for (let i = 13; i >= 0; i--) {
+            days.push(new Date(Date.now() + offset - i * 24 * 60 * 60 * 1000).toISOString().slice(0, 10));
+        }
+        const perDay = Object.fromEntries(days.map((d) => [d, { date: d, completed: 0, cancelled: 0 }]));
+
+        const routes = {};
+        const pickups = {};
+        const byDriver = {};
+        let revenue = 0, completed = 0, cancelled = 0;
+
+        for (const b of rows || []) {
+            const k = b.created_at ? dayKey(b.created_at) : null;
+            if (b.status === 'COMPLETED') {
+                completed += 1;
+                revenue += Number(b.fare) || 0;
+                if (k && perDay[k]) perDay[k].completed += 1;
+
+                const route = (b.pickup_name || '-') + ' to ' + (b.destination_name || '-');
+                routes[route] = (routes[route] || 0) + 1;
+                pickups[b.pickup_name || '-'] = (pickups[b.pickup_name || '-'] || 0) + 1;
+
+                if (b.driver_id) {
+                    const d = byDriver[b.driver_id] || (byDriver[b.driver_id] = { name: b.driver_name || '-', trips: 0, sum: 0, n: 0 });
+                    d.trips += 1;
+                    if (b.rating) { d.sum += b.rating; d.n += 1; }
+                }
+            } else if (b.status === 'CANCELLED') {
+                cancelled += 1;
+                if (k && perDay[k]) perDay[k].cancelled += 1;
+            }
+        }
+
+        const top = (obj, n) => Object.entries(obj).sort((a, b) => b[1] - a[1]).slice(0, n).map(([label, count]) => ({ label, count }));
+
+        res.status(200).json({
+            success: true,
+            totals: { completed, cancelled, revenue: parseFloat(revenue.toFixed(2)) },
+            perDay: days.map((d) => perDay[d]),
+            topRoutes: top(routes, 5),
+            topPickups: top(pickups, 5),
+            drivers: Object.values(byDriver)
+                .map((d) => ({ name: d.name, trips: d.trips, avg_rating: d.n ? parseFloat((d.sum / d.n).toFixed(2)) : null, rating_count: d.n }))
+                .sort((a, b) => b.trips - a.trips).slice(0, 10)
+        });
+    } catch (err) {
+        console.error('STATS ERROR:', err);
         res.status(500).json({ success: false, message: 'Server error.' });
     }
 });
@@ -1135,7 +1757,7 @@ const lastLocationWrite = new Map();
 io.use((socket, next) => {
     const token = socket.handshake.auth && socket.handshake.auth.token;
     const payload = verifyToken(token);
-    if (!payload) return next(new Error('unauthorized'));
+    if (!payload || !['passenger', 'driver'].includes(payload.role)) return next(new Error('unauthorized'));
     socket.data.auth = payload;
     socket.data.bookingRooms = new Set();
     next();
