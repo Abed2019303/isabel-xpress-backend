@@ -10,6 +10,7 @@
     --primary: #00695c; --primary-text: #ffffff; --danger: #b3261e;
     --warn-bg: #fff4e0; --warn-text: #8a5300; --ok-bg: #e3f6e8; --ok-text: #1b6b34;
     --info-bg: #e3f2fd; --info-text: #0b4f8a; --gray-bg: #eceff1; --gray-text: #455a64;
+    --bar-ok: #2e9e57; --bar-gray: #9aa7b4; --bar-info: #1e88e5;
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -17,6 +18,7 @@
       --primary: #26a69a; --primary-text: #06201d; --danger: #ff8a80;
       --warn-bg: #3a2c10; --warn-text: #ffcb7a; --ok-bg: #12351f; --ok-text: #7fdc9b;
       --info-bg: #10304a; --info-text: #8cc8f5; --gray-bg: #25303a; --gray-text: #b8c4cf;
+      --bar-ok: #4cc47a; --bar-gray: #6b7886; --bar-info: #5aa9ee;
     }
   }
   * { box-sizing: border-box; }
@@ -27,30 +29,35 @@
   header h1 { margin: 0; font-size: 1.15rem; }
   .header-actions { display: flex; align-items: center; gap: 10px; }
   #updated { font-size: .8rem; opacity: .85; }
-  main { max-width: 1100px; margin: 0 auto; padding: 20px; }
+  main { max-width: 1250px; margin: 0 auto; padding: 20px; }
   .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px; }
   .narrow { max-width: 380px; margin: 60px auto; }
   h2 { margin: 0 0 8px; font-size: 1.05rem; }
+  h3 { margin: 18px 0 8px; font-size: .95rem; }
   .muted { color: var(--muted); font-size: .9rem; }
   label { display: block; margin: 14px 0 6px; font-size: .9rem; }
-  input, select { width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--line);
-                  background: var(--bg); color: var(--text); font-size: 1rem; }
+  input, select, textarea { width: 100%; padding: 10px 12px; border-radius: 8px; border: 1px solid var(--line);
+                  background: var(--bg); color: var(--text); font-size: 1rem; font-family: inherit; }
   button { font: inherit; cursor: pointer; border: 0; border-radius: 8px; padding: 9px 14px;
            background: var(--primary); color: var(--primary-text); }
   button.ghost { background: transparent; color: inherit; border: 1px solid currentColor; padding: 6px 12px; }
   button.danger { background: transparent; color: var(--danger); border: 1px solid var(--danger); }
+  button.neutral { background: transparent; color: var(--text); border: 1px solid var(--line); }
+  button.small { padding: 5px 10px; font-size: .85rem; }
   button:disabled { opacity: .5; cursor: default; }
   #btnLogin { margin-top: 16px; width: 100%; }
   .error { color: var(--danger); min-height: 1.2em; margin: 10px 0 0; font-size: .9rem; }
-  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; margin-bottom: 16px; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 12px; margin-bottom: 16px; }
   .stat { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; }
-  .stat .n { font-size: 1.6rem; font-weight: 700; }
+  .stat .n { font-size: 1.5rem; font-weight: 700; }
   .stat .l { color: var(--muted); font-size: .8rem; }
-  .tabs { display: flex; gap: 8px; margin-bottom: 12px; }
+  .tabs { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
   .tab { background: var(--card); color: var(--text); border: 1px solid var(--line); }
   .tab.active { background: var(--primary); color: var(--primary-text); border-color: var(--primary); }
-  .toolbar { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+  .toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 12px; }
+  .toolbar input[type=search] { max-width: 280px; }
   .toolbar select { width: auto; }
+  .spacer { flex: 1; }
   .table-wrap { overflow-x: auto; }
   table { width: 100%; border-collapse: collapse; font-size: .92rem; }
   th, td { text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; white-space: nowrap; }
@@ -63,8 +70,25 @@
   .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; background: #9aa7b4; }
   .dot.on { background: #2e9e57; }
   .empty { text-align: center; color: var(--muted); padding: 24px 8px; }
+  .actions { display: flex; gap: 6px; }
+  .overlay { position: fixed; inset: 0; background: rgba(0,0,0,.5); display: flex; align-items: center; justify-content: center; padding: 16px; z-index: 10; }
+  .modal { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px; width: 100%; max-width: 420px; max-height: 90vh; overflow-y: auto; }
+  .modal .row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+  .modal img { width: 100%; max-height: 360px; object-fit: contain; border-radius: 8px; background: var(--bg); }
+  .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; }
+  .daybars { display: flex; align-items: flex-end; gap: 6px; height: 150px; padding-top: 8px; }
+  .daycol { flex: 1; display: flex; flex-direction: column; justify-content: flex-end; align-items: stretch; height: 100%; min-width: 0; }
+  .daycol .seg-ok { background: var(--bar-ok); }
+  .daycol .seg-gray { background: var(--bar-gray); }
+  .daylabels { display: flex; gap: 6px; margin-top: 4px; }
+  .daylabels span { flex: 1; text-align: center; font-size: .7rem; color: var(--muted); }
+  .legend { display: flex; gap: 14px; font-size: .8rem; color: var(--muted); margin-top: 8px; }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; }
+  .hbar { margin: 8px 0; font-size: .88rem; }
+  .hbar .track { background: var(--gray-bg); border-radius: 6px; height: 14px; margin-top: 3px; }
+  .hbar .fill { background: var(--bar-info); height: 100%; border-radius: 6px; }
   #toast { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); background: #263238; color: #fff;
-           padding: 10px 16px; border-radius: 8px; font-size: .9rem; display: none; max-width: 90%; }
+           padding: 10px 16px; border-radius: 8px; font-size: .9rem; display: none; max-width: 90%; z-index: 20; }
 </style>
 </head>
 <body>
@@ -89,22 +113,48 @@
 
   <section id="appView" hidden>
     <div id="stats" class="stats"></div>
+    <div id="tabs" class="tabs"></div>
 
-    <div class="tabs">
-      <button id="tabDrivers" class="tab active">Drivers</button>
-      <button id="tabBookings" class="tab">Bookings</button>
-      <button id="tabReports" class="tab">Reports</button>
+    <div id="panel-dashboard" class="card">
+      <h2>Dashboard</h2>
+      <p class="muted">Based on the most recent 3,000 bookings. Days use Philippine time.</p>
+      <div id="dashSummary" class="stats" style="margin-top:12px"></div>
+      <h3>Bookings per day (last 14 days)</h3>
+      <div id="dayChart"></div>
+      <div class="grid2">
+        <div><h3>Most popular routes</h3><div id="topRoutes"></div></div>
+        <div><h3>Busiest pickup points</h3><div id="topPickups"></div></div>
+      </div>
+      <h3>Driver performance (completed trips)</h3>
+      <div class="table-wrap"><table id="driverPerfTable"></table></div>
     </div>
 
-    <div id="panelDrivers" class="card">
-      <h2>Driver verification</h2>
-      <p class="muted">Check each driver's TODA body number against the official list, then verify. Unverified drivers cannot log in or accept bookings.</p>
+    <div id="panel-drivers" class="card" hidden>
+      <h2>Drivers</h2>
+      <p class="muted">Check each driver's TODA body number against the official list, then verify. Review the profile photo before approving it; passengers only see approved photos. Unverified drivers cannot accept bookings.</p>
+      <div class="toolbar">
+        <input id="search-drivers" type="search" placeholder="Search name, email, body or plate">
+        <span class="spacer"></span>
+        <button id="csv-drivers" class="neutral small">Export CSV</button>
+      </div>
       <div class="table-wrap"><table id="driversTable"></table></div>
     </div>
 
-    <div id="panelBookings" class="card" hidden>
+    <div id="panel-passengers" class="card" hidden>
+      <h2>Passengers</h2>
+      <p class="muted">Registered passengers. You can correct a name or email, or delete an account that has no trip records.</p>
+      <div class="toolbar">
+        <input id="search-passengers" type="search" placeholder="Search name or email">
+        <span class="spacer"></span>
+        <button id="csv-passengers" class="neutral small">Export CSV</button>
+      </div>
+      <div class="table-wrap"><table id="passengersTable"></table></div>
+    </div>
+
+    <div id="panel-bookings" class="card" hidden>
       <h2>Bookings and trip records</h2>
       <div class="toolbar">
+        <input id="search-bookings" type="search" placeholder="Search passenger, driver or place">
         <label for="statusFilter" style="margin:0">Status</label>
         <select id="statusFilter">
           <option value="ALL">All</option>
@@ -113,14 +163,41 @@
           <option value="COMPLETED">Completed</option>
           <option value="CANCELLED">Cancelled</option>
         </select>
+        <span class="spacer"></span>
+        <button id="csv-bookings" class="neutral small">Export CSV</button>
       </div>
       <div class="table-wrap"><table id="bookingsTable"></table></div>
     </div>
 
-    <div id="panelReports" class="card" hidden>
+    <div id="panel-reports" class="card" hidden>
       <h2>Passenger reports</h2>
       <p class="muted">Reports sent by passengers about a trip or driver. Review each one, then mark it resolved. Suspend a driver from the Drivers tab if needed.</p>
+      <div class="toolbar">
+        <input id="search-reports" type="search" placeholder="Search driver, passenger or reason">
+        <span class="spacer"></span>
+        <button id="csv-reports" class="neutral small">Export CSV</button>
+      </div>
       <div class="table-wrap"><table id="reportsTable"></table></div>
+    </div>
+
+    <div id="panel-announcements" class="card" hidden>
+      <h2>Announcements to drivers</h2>
+      <p class="muted">Online drivers see the message right away. Offline drivers see the latest one (up to 7 days old) when they open the app.</p>
+      <label for="announceText">Message (200 characters max)</label>
+      <textarea id="announceText" rows="3" maxlength="200"></textarea>
+      <div class="toolbar" style="margin-top:10px"><button id="btnAnnounce">Send to drivers</button></div>
+      <div class="table-wrap"><table id="announcementsTable"></table></div>
+    </div>
+
+    <div id="panel-activity" class="card" hidden>
+      <h2>Administrator activity log</h2>
+      <p class="muted">A record of what was verified, edited, deleted or cancelled from this page.</p>
+      <div class="toolbar">
+        <input id="search-activity" type="search" placeholder="Search action or detail">
+        <span class="spacer"></span>
+        <button id="csv-activity" class="neutral small">Export CSV</button>
+      </div>
+      <div class="table-wrap"><table id="activityTable"></table></div>
     </div>
   </section>
 </main>
@@ -131,10 +208,14 @@
 (function () {
   const $ = (id) => document.getElementById(id);
   let adminKey = sessionStorage.getItem('adminKey') || '';
-  let drivers = [];
-  let bookings = [];
-  let reports = [];
+  let drivers = [], passengers = [], bookings = [], reports = [], announcements = [], logs = [], stats = null;
   let timer = null;
+  let currentTab = 'dashboard';
+
+  const TABS = [
+    ['dashboard', 'Dashboard'], ['drivers', 'Drivers'], ['passengers', 'Passengers'],
+    ['bookings', 'Bookings'], ['reports', 'Reports'], ['announcements', 'Announcements'], ['activity', 'Activity']
+  ];
 
   // Builds elements with textContent only, so database text can never inject HTML
   function h(tag, props, ...kids) {
@@ -142,12 +223,13 @@
     if (props) {
       for (const [k, v] of Object.entries(props)) {
         if (k === 'class') n.className = v;
+        else if (k === 'style') n.setAttribute('style', v);
         else if (k.startsWith('on')) n.addEventListener(k.slice(2), v);
         else n.setAttribute(k, v);
       }
     }
-    for (const kid of kids.flat()) {
-      if (kid === null || kid === undefined) continue;
+    for (const kid of kids.flat(Infinity)) {
+      if (kid === null || kid === undefined || kid === false) continue;
       n.append(kid);
     }
     return n;
@@ -179,6 +261,9 @@
     return data;
   }
 
+  const send = (method, path, body) =>
+    api(path, { method, body: body === undefined ? undefined : JSON.stringify(body) });
+
   function showLogin(msg) {
     clearInterval(timer); timer = null;
     $('appView').hidden = true;
@@ -194,22 +279,25 @@
     $('appView').hidden = false;
     $('btnRefresh').hidden = false;
     $('btnLogout').hidden = false;
-    if (!timer) timer = setInterval(loadAll, 10000);
+    if (!timer) timer = setInterval(loadAll, 15000);
   }
 
   async function loadAll() {
     try {
-      const [d, b, r] = await Promise.all([
-        api('/admin/api/drivers'), api('/admin/api/bookings'), api('/admin/api/reports')
+      const [d, b, r, p, a, l, s] = await Promise.all([
+        api('/admin/api/drivers'), api('/admin/api/bookings'), api('/admin/api/reports'),
+        api('/admin/api/passengers'), api('/admin/api/announcements'), api('/admin/api/logs'),
+        api('/admin/api/stats')
       ]);
       drivers = d.drivers || [];
       bookings = b.bookings || [];
       reports = r.reports || [];
+      passengers = p.passengers || [];
+      announcements = a.announcements || [];
+      logs = l.logs || [];
+      stats = s;
       showApp();
-      renderStats();
-      renderDrivers();
-      renderBookings();
-      renderReports();
+      renderAll();
       $('updated').textContent = 'Updated ' + new Date().toLocaleTimeString();
     } catch (e) {
       if (e.auth) {
@@ -222,84 +310,281 @@
     }
   }
 
-  const fmtDate = (iso) => iso ? new Date(iso).toLocaleString() : '-';
-  const fmtFare = (n) => '\u20B1' + Number(n || 0).toFixed(2);
+  function renderAll() {
+    renderStats(); renderDashboard(); renderDrivers(); renderPassengers();
+    renderBookings(); renderReports(); renderAnnouncements(); renderActivity();
+  }
 
-  function badge(text, cls) { return h('span', { class: 'badge ' + cls }, text); }
+  const fmtDate = (iso) => iso ? new Date(iso).toLocaleString() : '-';
+  const fmtFare = (n) => '₱' + Number(n || 0).toFixed(2);
+  const badge = (text, cls) => h('span', { class: 'badge ' + cls }, text);
+  const contains = (hay, q) => !q || hay.filter(Boolean).join(' ').toLowerCase().includes(q.toLowerCase());
+  const val = (id) => ($(id) ? $(id).value.trim() : '');
 
   function statusBadge(status) {
     const map = { PENDING: 'b-warn', ACCEPTED: 'b-info', COMPLETED: 'b-ok', CANCELLED: 'b-gray' };
     return badge(status || '-', map[status] || 'b-gray');
   }
 
+  function emptyRow(cols, text) {
+    return h('tbody', null, h('tr', null, h('td', { colspan: String(cols), class: 'empty' }, text)));
+  }
+
+  // ---------------------------------------------------------------- CSV
+  function csvCell(v) {
+    let s = v === null || v === undefined ? '' : String(v);
+    if (/^[=+\-@\t\r]/.test(s)) s = "'" + s;          // stops spreadsheet formula injection
+    return '"' + s.replace(/"/g, '""') + '"';
+  }
+
+  function downloadCsv(name, columns, rows) {
+    const lines = [columns.map((c) => csvCell(c[0])).join(',')];
+    for (const r of rows) lines.push(columns.map((c) => csvCell(c[1](r))).join(','));
+    const blob = new Blob(['﻿' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
+    const a = h('a', { href: URL.createObjectURL(blob), download: name + '-' + new Date().toISOString().slice(0, 10) + '.csv' });
+    document.body.append(a);
+    a.click();
+    a.remove();
+    toast('Exported ' + rows.length + ' rows');
+  }
+
+  // ---------------------------------------------------------------- forms
+  // A small form window. fields = [{ key, label, value, type }]
+  function openForm(title, fields, onSave) {
+    const inputs = {};
+    const err = h('p', { class: 'error', role: 'alert' });
+    const body = fields.map((f) => {
+      const input = h('input', { type: f.type || 'text', value: f.value || '', id: 'f_' + f.key });
+      inputs[f.key] = input;
+      return [h('label', { for: 'f_' + f.key }, f.label), input];
+    });
+    const overlay = h('div', { class: 'overlay' });
+    const close = () => overlay.remove();
+    const save = h('button', { onclick: async () => {
+      const values = {};
+      for (const f of fields) values[f.key] = inputs[f.key].value;
+      save.disabled = true;
+      try { await onSave(values); close(); }
+      catch (e) { err.textContent = e.message; save.disabled = false; }
+    } }, 'Save');
+    overlay.append(h('div', { class: 'modal' },
+      h('h2', null, title), body, err,
+      h('div', { class: 'row' }, h('button', { class: 'neutral', onclick: close }, 'Cancel'), save)));
+    document.body.append(overlay);
+    overlay.querySelector('input').focus();
+  }
+
+  // ---------------------------------------------------------------- stats strip + dashboard
   function renderStats() {
     const count = (fn, list) => list.filter(fn).length;
     const items = [
       ['Drivers', drivers.length],
+      ['Passengers', passengers.length],
       ['Pending verification', count((x) => !x.is_verified, drivers)],
-      ['Verified', count((x) => x.is_verified, drivers)],
+      ['Photos to review', count((x) => x.photo_status === 'PENDING', drivers)],
       ['Online now', count((x) => x.is_online, drivers)],
       ['Pending bookings', count((x) => x.status === 'PENDING', bookings)],
       ['Trips in progress', count((x) => x.status === 'ACCEPTED', bookings)],
       ['Completed trips', count((x) => x.status === 'COMPLETED', bookings)],
       ['Open reports', count((x) => x.status === 'OPEN', reports)]
     ];
-    const box = $('stats');
-    box.replaceChildren(...items.map(([label, n]) =>
+    $('stats').replaceChildren(...items.map(([label, n]) =>
       h('div', { class: 'stat' }, h('div', { class: 'n' }, String(n)), h('div', { class: 'l' }, label))));
   }
 
+  function hbars(el, list) {
+    if (!list || !list.length) { el.replaceChildren(h('p', { class: 'muted' }, 'No completed trips yet.')); return; }
+    const max = Math.max(...list.map((x) => x.count));
+    el.replaceChildren(...list.map((x) => h('div', { class: 'hbar' },
+      h('div', null, x.label + ' — ' + x.count),
+      h('div', { class: 'track' }, h('div', { class: 'fill', style: 'width:' + Math.max(4, Math.round(x.count / max * 100)) + '%' })))));
+  }
+
+  function renderDashboard() {
+    if (!stats) return;
+    const t = stats.totals;
+    $('dashSummary').replaceChildren(...[
+      ['Completed trips', t.completed], ['Cancelled', t.cancelled], ['Fares collected (cash)', fmtFare(t.revenue)]
+    ].map(([l, n]) => h('div', { class: 'stat' }, h('div', { class: 'n' }, String(n)), h('div', { class: 'l' }, l))));
+
+    const days = stats.perDay || [];
+    const max = Math.max(1, ...days.map((d) => d.completed + d.cancelled));
+    const cols = days.map((d) => {
+      const total = d.completed + d.cancelled;
+      return h('div', { class: 'daycol', title: d.date + ': ' + d.completed + ' completed, ' + d.cancelled + ' cancelled' },
+        h('div', { class: 'seg-gray', style: 'height:' + (d.cancelled / max * 100) + '%' }),
+        h('div', { class: 'seg-ok', style: 'height:' + (d.completed / max * 100) + '%' }),
+        total === 0 ? h('div', { style: 'height:2px;background:var(--line)' }) : null);
+    });
+    $('dayChart').replaceChildren(
+      h('div', { class: 'daybars' }, cols),
+      h('div', { class: 'daylabels' }, days.map((d) => h('span', null, d.date.slice(5)))),
+      h('div', { class: 'legend' },
+        h('span', null, h('i', { style: 'background:var(--bar-ok)' }), 'Completed'),
+        h('span', null, h('i', { style: 'background:var(--bar-gray)' }), 'Cancelled')));
+
+    hbars($('topRoutes'), stats.topRoutes);
+    hbars($('topPickups'), stats.topPickups);
+
+    const head = h('thead', null, h('tr', null, ['Driver', 'Completed trips', 'Average rating'].map((x) => h('th', null, x))));
+    const rows = (stats.drivers || []).map((d) => h('tr', null,
+      h('td', null, d.name), h('td', null, String(d.trips)),
+      h('td', null, d.avg_rating ? d.avg_rating.toFixed(1) + ' / 5 (' + d.rating_count + ' ratings)' : '-')));
+    $('driverPerfTable').replaceChildren(head, rows.length ? h('tbody', null, rows) : emptyRow(3, 'No completed trips yet.'));
+  }
+
+  // ---------------------------------------------------------------- drivers
   async function setVerified(driver, verified) {
-    if (!verified && !confirm('Suspend ' + driver.full_name + '? They will be taken offline and cannot log in.')) return;
+    if (!verified && !confirm('Suspend ' + driver.full_name + '? They will be taken offline and cannot accept bookings.')) return;
     try {
-      await api('/admin/api/drivers/' + encodeURIComponent(driver.id) + '/verify', {
-        method: 'POST',
-        body: JSON.stringify({ verified })
-      });
+      await send('POST', '/admin/api/drivers/' + encodeURIComponent(driver.id) + '/verify', { verified });
       toast(driver.full_name + (verified ? ' verified' : ' suspended'));
       loadAll();
-    } catch (e) {
-      toast(e.message);
-    }
+    } catch (e) { toast(e.message); }
+  }
+
+  function editDriver(d) {
+    openForm('Edit driver', [
+      { key: 'full_name', label: 'Full name', value: d.full_name },
+      { key: 'email', label: 'Email', value: d.email, type: 'email' },
+      { key: 'toda_body_number', label: 'TODA body number', value: d.toda_body_number },
+      { key: 'vehicle_model', label: 'Vehicle', value: d.vehicle_model }
+    ], async (v) => {
+      await send('PATCH', '/admin/api/drivers/' + encodeURIComponent(d.id), v);
+      toast('Driver updated'); loadAll();
+    });
+  }
+
+  async function deleteDriver(d) {
+    if (!confirm('Delete ' + d.full_name + ' permanently? This cannot be undone.')) return;
+    try {
+      await send('DELETE', '/admin/api/drivers/' + encodeURIComponent(d.id));
+      toast('Driver deleted'); loadAll();
+    } catch (e) { toast(e.message); }
+  }
+
+  async function reviewPhoto(d) {
+    let info;
+    try { info = (await api('/admin/api/drivers/' + encodeURIComponent(d.id) + '/photo')).driver; }
+    catch (e) { toast(e.message); return; }
+
+    const ok = typeof info.photo === 'string' && /^data:image\/jpeg;base64,[A-Za-z0-9+/=]+$/.test(info.photo);
+    const overlay = h('div', { class: 'overlay' });
+    const close = () => overlay.remove();
+    const decide = async (approve) => {
+      try {
+        await send('POST', '/admin/api/drivers/' + encodeURIComponent(d.id) + '/photo-review', { approve });
+        toast(approve ? 'Photo approved' : 'Photo rejected'); close(); loadAll();
+      } catch (e) { toast(e.message); }
+    };
+    overlay.append(h('div', { class: 'modal' },
+      h('h2', null, 'Photo of ' + info.full_name),
+      h('p', { class: 'muted' }, 'Plate number: ' + (info.plate_number || 'not entered') + ' • Status: ' + info.photo_status),
+      ok ? h('img', { src: info.photo, alt: 'Driver photo' }) : h('p', { class: 'empty' }, 'No photo uploaded.'),
+      h('div', { class: 'row' },
+        h('button', { class: 'neutral', onclick: close }, 'Close'),
+        ok ? h('button', { class: 'danger', onclick: () => decide(false) }, 'Reject') : null,
+        ok ? h('button', { onclick: () => decide(true) }, 'Approve') : null)));
+    document.body.append(overlay);
+  }
+
+  const driverRows = () => drivers.filter((d) =>
+    contains([d.full_name, d.email, d.toda_body_number, d.plate_number, d.vehicle_model], val('search-drivers')));
+
+  function photoBadge(s) {
+    if (s === 'APPROVED') return badge('Approved', 'b-ok');
+    if (s === 'PENDING') return badge('To review', 'b-warn');
+    if (s === 'REJECTED') return badge('Rejected', 'b-gray');
+    return badge('None', 'b-gray');
   }
 
   function renderDrivers() {
-    const sorted = [...drivers].sort((a, b) =>
+    const sorted = [...driverRows()].sort((a, b) =>
       (a.is_verified === b.is_verified ? 0 : a.is_verified ? 1 : -1) ||
       new Date(b.created_at) - new Date(a.created_at));
 
     const head = h('thead', null, h('tr', null,
-      ['Name', 'Email', 'Body #', 'Vehicle', 'Status', 'Online', 'Rating', 'Reports', 'Registered', ''].map((t) => h('th', null, t))));
+      ['Name', 'Email', 'Body #', 'Plate', 'Vehicle', 'Status', 'Photo', 'Online', 'Rating', 'Reports', 'Registered', '']
+        .map((t) => h('th', null, t))));
 
     const rows = sorted.map((d) => h('tr', null,
       h('td', null, d.full_name),
-      h('td', null, d.email),
+      h('td', null, d.email, d.email_verified === false ? [' ', badge('email not verified', 'b-warn')] : null),
       h('td', null, d.toda_body_number || '-'),
+      h('td', null, d.plate_number || '-'),
       h('td', null, d.vehicle_model || '-'),
       h('td', null, d.is_verified ? badge('Verified', 'b-ok') : badge('Pending', 'b-warn')),
+      h('td', null, photoBadge(d.photo_status)),
       h('td', null, h('span', { class: 'dot' + (d.is_online ? ' on' : '') }), d.is_online ? 'Online' : 'Offline'),
       h('td', null, d.avg_rating ? d.avg_rating.toFixed(1) + ' / 5 (' + d.rating_count + ')' : '-'),
       h('td', null, d.open_reports ? badge(d.open_reports + ' open', 'b-warn') : '-'),
       h('td', null, fmtDate(d.created_at)),
-      h('td', null, d.is_verified
-        ? h('button', { class: 'danger', onclick: () => setVerified(d, false) }, 'Suspend')
-        : h('button', { onclick: () => setVerified(d, true) }, 'Verify'))));
+      h('td', null, h('div', { class: 'actions' },
+        d.is_verified
+          ? h('button', { class: 'small danger', onclick: () => setVerified(d, false) }, 'Suspend')
+          : h('button', { class: 'small', onclick: () => setVerified(d, true) }, 'Verify'),
+        d.photo_status && d.photo_status !== 'NONE'
+          ? h('button', { class: 'small neutral', onclick: () => reviewPhoto(d) }, 'Photo') : null,
+        h('button', { class: 'small neutral', onclick: () => editDriver(d) }, 'Edit'),
+        h('button', { class: 'small danger', onclick: () => deleteDriver(d) }, 'Delete')))));
 
-    const body = rows.length
-      ? h('tbody', null, rows)
-      : h('tbody', null, h('tr', null, h('td', { colspan: '10', class: 'empty' }, 'No drivers registered yet.')));
-
-    $('driversTable').replaceChildren(head, body);
+    $('driversTable').replaceChildren(head, rows.length ? h('tbody', null, rows) : emptyRow(12, 'No drivers found.'));
   }
 
+  // ---------------------------------------------------------------- passengers
+  function editPassenger(p) {
+    openForm('Edit passenger', [
+      { key: 'full_name', label: 'Full name', value: p.full_name },
+      { key: 'email', label: 'Email', value: p.email, type: 'email' }
+    ], async (v) => {
+      await send('PATCH', '/admin/api/passengers/' + encodeURIComponent(p.id), v);
+      toast('Passenger updated'); loadAll();
+    });
+  }
+
+  async function deletePassenger(p) {
+    if (!confirm('Delete ' + p.full_name + ' permanently? This cannot be undone.')) return;
+    try {
+      await send('DELETE', '/admin/api/passengers/' + encodeURIComponent(p.id));
+      toast('Passenger deleted'); loadAll();
+    } catch (e) { toast(e.message); }
+  }
+
+  const passengerRows = () => passengers.filter((p) => contains([p.full_name, p.email], val('search-passengers')));
+
+  function renderPassengers() {
+    const head = h('thead', null, h('tr', null, ['Name', 'Email', 'Registered', ''].map((t) => h('th', null, t))));
+    const rows = passengerRows().map((p) => h('tr', null,
+      h('td', null, p.full_name),
+      h('td', null, p.email, p.email_verified === false ? [' ', badge('email not verified', 'b-warn')] : null),
+      h('td', null, fmtDate(p.created_at)),
+      h('td', null, h('div', { class: 'actions' },
+        h('button', { class: 'small neutral', onclick: () => editPassenger(p) }, 'Edit'),
+        h('button', { class: 'small danger', onclick: () => deletePassenger(p) }, 'Delete')))));
+    $('passengersTable').replaceChildren(head, rows.length ? h('tbody', null, rows) : emptyRow(4, 'No passengers found.'));
+  }
+
+  // ---------------------------------------------------------------- bookings
+  async function cancelBooking(b) {
+    if (!confirm('Cancel this booking for ' + (b.passenger_name || 'the passenger') + '?')) return;
+    try {
+      await send('POST', '/admin/api/bookings/' + encodeURIComponent(b.id) + '/cancel', {});
+      toast('Booking cancelled'); loadAll();
+    } catch (e) { toast(e.message); }
+  }
+
+  const bookingRows = () => {
+    const f = $('statusFilter').value;
+    return bookings.filter((b) => (f === 'ALL' || b.status === f) &&
+      contains([b.passenger_name, b.driver_name, b.pickup_name, b.destination_name, b.driver_body_number], val('search-bookings')));
+  };
+
   function renderBookings() {
-    const filter = $('statusFilter').value;
-    const list = bookings.filter((b) => filter === 'ALL' || b.status === filter);
-
     const head = h('thead', null, h('tr', null,
-      ['Created', 'Passenger', 'Pickup', 'Destination', 'Fare', 'Status', 'Driver', 'Rating', 'Completed'].map((t) => h('th', null, t))));
+      ['Created', 'Passenger', 'Pickup', 'Destination', 'Fare', 'Status', 'Driver', 'Rating', 'Completed', '']
+        .map((t) => h('th', null, t))));
 
-    const rows = list.map((b) => h('tr', null,
+    const rows = bookingRows().map((b) => h('tr', null,
       h('td', null, fmtDate(b.created_at)),
       h('td', null, b.passenger_name || '-'),
       h('td', null, b.pickup_name || '-'),
@@ -308,52 +593,85 @@
       h('td', null, statusBadge(b.status)),
       h('td', null, b.driver_name ? b.driver_name + ' (#' + (b.driver_body_number || '-') + ')' : '-'),
       h('td', null, b.rating ? b.rating + ' / 5' : '-'),
-      h('td', null, fmtDate(b.completed_at))));
+      h('td', null, fmtDate(b.completed_at)),
+      h('td', null, (b.status === 'PENDING' || b.status === 'ACCEPTED')
+        ? h('button', { class: 'small danger', onclick: () => cancelBooking(b) }, 'Cancel') : null)));
 
-    const body = rows.length
-      ? h('tbody', null, rows)
-      : h('tbody', null, h('tr', null, h('td', { colspan: '9', class: 'empty' }, 'No bookings found.')));
-
-    $('bookingsTable').replaceChildren(head, body);
+    $('bookingsTable').replaceChildren(head, rows.length ? h('tbody', null, rows) : emptyRow(10, 'No bookings found.'));
   }
 
+  // ---------------------------------------------------------------- reports
   async function resolveReport(r) {
     try {
-      await api('/admin/api/reports/' + encodeURIComponent(r.id) + '/resolve', { method: 'POST', body: '{}' });
-      toast('Report marked as resolved');
-      loadAll();
-    } catch (e) {
-      toast(e.message);
-    }
+      await send('POST', '/admin/api/reports/' + encodeURIComponent(r.id) + '/resolve', {});
+      toast('Report marked as resolved'); loadAll();
+    } catch (e) { toast(e.message); }
   }
+
+  async function deleteReport(r) {
+    if (!confirm('Delete this report permanently?')) return;
+    try {
+      await send('DELETE', '/admin/api/reports/' + encodeURIComponent(r.id));
+      toast('Report deleted'); loadAll();
+    } catch (e) { toast(e.message); }
+  }
+
+  const reportRows = () => reports.filter((r) =>
+    contains([r.driver_name, r.passenger_name, r.reason, r.details], val('search-reports')));
 
   function renderReports() {
     const head = h('thead', null, h('tr', null,
       ['Date', 'Driver', 'Passenger', 'Reason', 'Details', 'Status', ''].map((t) => h('th', null, t))));
 
-    const rows = reports.map((r) => h('tr', null,
+    const rows = reportRows().map((r) => h('tr', null,
       h('td', null, fmtDate(r.created_at)),
       h('td', null, r.driver_name ? r.driver_name + ' (#' + (r.driver_body_number || '-') + ')' : '-'),
       h('td', null, r.passenger_name || '-'),
       h('td', null, r.reason || '-'),
       h('td', { style: 'white-space:normal;min-width:180px' }, r.details || '-'),
       h('td', null, r.status === 'OPEN' ? badge('Open', 'b-warn') : badge('Resolved', 'b-ok')),
-      h('td', null, r.status === 'OPEN' ? h('button', { onclick: () => resolveReport(r) }, 'Mark resolved') : null)));
+      h('td', null, h('div', { class: 'actions' },
+        r.status === 'OPEN' ? h('button', { class: 'small', onclick: () => resolveReport(r) }, 'Mark resolved') : null,
+        h('button', { class: 'small danger', onclick: () => deleteReport(r) }, 'Delete')))));
 
-    const body = rows.length
-      ? h('tbody', null, rows)
-      : h('tbody', null, h('tr', null, h('td', { colspan: '7', class: 'empty' }, 'No reports yet.')));
-
-    $('reportsTable').replaceChildren(head, body);
+    $('reportsTable').replaceChildren(head, rows.length ? h('tbody', null, rows) : emptyRow(7, 'No reports found.'));
   }
 
+  // ---------------------------------------------------------------- announcements
+  async function deleteAnnouncement(a) {
+    if (!confirm('Delete this announcement?')) return;
+    try {
+      await send('DELETE', '/admin/api/announcements/' + encodeURIComponent(a.id));
+      toast('Announcement deleted'); loadAll();
+    } catch (e) { toast(e.message); }
+  }
+
+  function renderAnnouncements() {
+    const head = h('thead', null, h('tr', null, ['Sent', 'Message', ''].map((t) => h('th', null, t))));
+    const rows = announcements.map((a) => h('tr', null,
+      h('td', null, fmtDate(a.created_at)),
+      h('td', { style: 'white-space:normal' }, a.message),
+      h('td', null, h('button', { class: 'small danger', onclick: () => deleteAnnouncement(a) }, 'Delete'))));
+    $('announcementsTable').replaceChildren(head, rows.length ? h('tbody', null, rows) : emptyRow(3, 'No announcements yet.'));
+  }
+
+  // ---------------------------------------------------------------- activity
+  const logRows = () => logs.filter((l) => contains([l.action, l.detail], val('search-activity')));
+
+  function renderActivity() {
+    const head = h('thead', null, h('tr', null, ['Time', 'Action', 'Detail'].map((t) => h('th', null, t))));
+    const rows = logRows().map((l) => h('tr', null,
+      h('td', null, fmtDate(l.created_at)), h('td', null, badge(l.action, 'b-info')),
+      h('td', { style: 'white-space:normal' }, l.detail || '-')));
+    $('activityTable').replaceChildren(head, rows.length ? h('tbody', null, rows) : emptyRow(3, 'Nothing logged yet.'));
+  }
+
+  // ---------------------------------------------------------------- tabs and wiring
   function selectTab(name) {
-    $('panelDrivers').hidden = name !== 'drivers';
-    $('panelBookings').hidden = name !== 'bookings';
-    $('panelReports').hidden = name !== 'reports';
-    $('tabDrivers').classList.toggle('active', name === 'drivers');
-    $('tabBookings').classList.toggle('active', name === 'bookings');
-    $('tabReports').classList.toggle('active', name === 'reports');
+    currentTab = name;
+    for (const [id] of TABS) $('panel-' + id).hidden = id !== name;
+    $('tabs').replaceChildren(...TABS.map(([id, label]) =>
+      h('button', { class: 'tab' + (id === name ? ' active' : ''), onclick: () => selectTab(id) }, label)));
   }
 
   function signIn() {
@@ -374,11 +692,55 @@
     adminKey = '';
     showLogin('');
   });
-  $('tabDrivers').addEventListener('click', () => selectTab('drivers'));
-  $('tabBookings').addEventListener('click', () => selectTab('bookings'));
-  $('tabReports').addEventListener('click', () => selectTab('reports'));
+
+  $('search-drivers').addEventListener('input', renderDrivers);
+  $('search-passengers').addEventListener('input', renderPassengers);
+  $('search-bookings').addEventListener('input', renderBookings);
+  $('search-reports').addEventListener('input', renderReports);
+  $('search-activity').addEventListener('input', renderActivity);
   $('statusFilter').addEventListener('change', renderBookings);
 
+  $('csv-drivers').addEventListener('click', () => downloadCsv('drivers', [
+    ['Name', (d) => d.full_name], ['Email', (d) => d.email], ['Body number', (d) => d.toda_body_number],
+    ['Plate', (d) => d.plate_number], ['Vehicle', (d) => d.vehicle_model],
+    ['Verified', (d) => d.is_verified ? 'Yes' : 'No'], ['Photo status', (d) => d.photo_status],
+    ['Average rating', (d) => d.avg_rating], ['Ratings', (d) => d.rating_count],
+    ['Open reports', (d) => d.open_reports], ['Registered', (d) => d.created_at]
+  ], driverRows()));
+
+  $('csv-passengers').addEventListener('click', () => downloadCsv('passengers', [
+    ['Name', (p) => p.full_name], ['Email', (p) => p.email], ['Registered', (p) => p.created_at]
+  ], passengerRows()));
+
+  $('csv-bookings').addEventListener('click', () => downloadCsv('bookings', [
+    ['Created', (b) => b.created_at], ['Passenger', (b) => b.passenger_name], ['Pickup', (b) => b.pickup_name],
+    ['Destination', (b) => b.destination_name], ['Distance km', (b) => b.distance_km], ['Fare', (b) => b.fare],
+    ['Discounted', (b) => b.is_discounted ? 'Yes' : 'No'], ['Status', (b) => b.status],
+    ['Driver', (b) => b.driver_name], ['Body number', (b) => b.driver_body_number],
+    ['Rating', (b) => b.rating], ['Completed', (b) => b.completed_at]
+  ], bookingRows()));
+
+  $('csv-reports').addEventListener('click', () => downloadCsv('reports', [
+    ['Date', (r) => r.created_at], ['Driver', (r) => r.driver_name], ['Body number', (r) => r.driver_body_number],
+    ['Passenger', (r) => r.passenger_name], ['Reason', (r) => r.reason], ['Details', (r) => r.details],
+    ['Status', (r) => r.status]
+  ], reportRows()));
+
+  $('csv-activity').addEventListener('click', () => downloadCsv('activity-log', [
+    ['Time', (l) => l.created_at], ['Action', (l) => l.action], ['Detail', (l) => l.detail]
+  ], logRows()));
+
+  $('btnAnnounce').addEventListener('click', async () => {
+    const message = $('announceText').value.trim();
+    if (!message) { toast('Type a message first.'); return; }
+    try {
+      await send('POST', '/admin/api/announcements', { message });
+      $('announceText').value = '';
+      toast('Sent to all online drivers'); loadAll();
+    } catch (e) { toast(e.message); }
+  });
+
+  selectTab('dashboard');
   if (adminKey) loadAll(); else showLogin('');
 })();
 </script>
