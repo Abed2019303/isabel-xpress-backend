@@ -469,6 +469,7 @@
     openForm('Edit driver', [
       { key: 'full_name', label: 'Full name', value: d.full_name },
       { key: 'email', label: 'Email', value: d.email, type: 'email' },
+      { key: 'phone', label: 'Mobile number', value: d.phone, type: 'tel' },
       { key: 'toda_body_number', label: 'TODA body number', value: d.toda_body_number },
       { key: 'vehicle_model', label: 'Vehicle', value: d.vehicle_model }
     ], async (v) => {
@@ -511,7 +512,7 @@
   }
 
   const driverRows = () => drivers.filter((d) =>
-    contains([d.full_name, d.email, d.toda_body_number, d.plate_number, d.vehicle_model], val('search-drivers')));
+    contains([d.full_name, d.email, d.phone, d.toda_body_number, d.plate_number, d.vehicle_model], val('search-drivers')));
 
   function photoBadge(s) {
     if (s === 'APPROVED') return badge('Approved', 'b-ok');
@@ -526,12 +527,13 @@
       new Date(b.created_at) - new Date(a.created_at));
 
     const head = h('thead', null, h('tr', null,
-      ['Name', 'Email', 'Body #', 'Plate', 'Vehicle', 'Status', 'Photo', 'Online', 'Rating', 'Reports', 'Registered', '']
+      ['Name', 'Email', 'Mobile', 'Body #', 'Plate', 'Vehicle', 'Status', 'Photo', 'Online', 'Rating', 'Reports', 'Registered', '']
         .map((t) => h('th', null, t))));
 
     const rows = sorted.map((d) => h('tr', null,
       h('td', null, d.full_name),
       h('td', null, d.email, d.email_verified === false ? [' ', badge('email not verified', 'b-warn')] : null),
+      h('td', null, d.phone || '-'),
       h('td', null, d.toda_body_number || '-'),
       h('td', null, d.plate_number || '-'),
       h('td', null, d.vehicle_model || '-'),
@@ -550,14 +552,15 @@
         h('button', { class: 'small neutral', onclick: () => editDriver(d) }, 'Edit'),
         h('button', { class: 'small danger', onclick: () => deleteDriver(d) }, 'Delete')))));
 
-    $('driversTable').replaceChildren(head, rows.length ? h('tbody', null, rows) : emptyRow(12, 'No drivers found.'));
+    $('driversTable').replaceChildren(head, rows.length ? h('tbody', null, rows) : emptyRow(13, 'No drivers found.'));
   }
 
   // ---------------------------------------------------------------- passengers
   function editPassenger(p) {
     openForm('Edit passenger', [
       { key: 'full_name', label: 'Full name', value: p.full_name },
-      { key: 'email', label: 'Email', value: p.email, type: 'email' }
+      { key: 'email', label: 'Email', value: p.email, type: 'email' },
+      { key: 'phone', label: 'Mobile number', value: p.phone, type: 'tel' }
     ], async (v) => {
       await send('PATCH', '/admin/api/passengers/' + encodeURIComponent(p.id), v);
       toast('Passenger updated'); loadAll();
@@ -572,18 +575,19 @@
     } catch (e) { toast(e.message); }
   }
 
-  const passengerRows = () => passengers.filter((p) => contains([p.full_name, p.email], val('search-passengers')));
+  const passengerRows = () => passengers.filter((p) => contains([p.full_name, p.email, p.phone], val('search-passengers')));
 
   function renderPassengers() {
-    const head = h('thead', null, h('tr', null, ['Name', 'Email', 'Registered', ''].map((t) => h('th', null, t))));
+    const head = h('thead', null, h('tr', null, ['Name', 'Email', 'Mobile', 'Registered', ''].map((t) => h('th', null, t))));
     const rows = passengerRows().map((p) => h('tr', null,
       h('td', null, p.full_name),
       h('td', null, p.email, p.email_verified === false ? [' ', badge('email not verified', 'b-warn')] : null),
+      h('td', null, p.phone || '-'),
       h('td', null, fmtDate(p.created_at)),
       h('td', null, h('div', { class: 'actions' },
         h('button', { class: 'small neutral', onclick: () => editPassenger(p) }, 'Edit'),
         h('button', { class: 'small danger', onclick: () => deletePassenger(p) }, 'Delete')))));
-    $('passengersTable').replaceChildren(head, rows.length ? h('tbody', null, rows) : emptyRow(4, 'No passengers found.'));
+    $('passengersTable').replaceChildren(head, rows.length ? h('tbody', null, rows) : emptyRow(5, 'No passengers found.'));
   }
 
   // ---------------------------------------------------------------- bookings
@@ -723,7 +727,7 @@
   $('statusFilter').addEventListener('change', renderBookings);
 
   $('csv-drivers').addEventListener('click', () => downloadCsv('drivers', [
-    ['Name', (d) => d.full_name], ['Email', (d) => d.email], ['Body number', (d) => d.toda_body_number],
+    ['Name', (d) => d.full_name], ['Email', (d) => d.email], ['Mobile', (d) => d.phone], ['Body number', (d) => d.toda_body_number],
     ['Plate', (d) => d.plate_number], ['Vehicle', (d) => d.vehicle_model],
     ['Verified', (d) => d.is_verified ? 'Yes' : 'No'], ['Photo status', (d) => d.photo_status],
     ['Average rating', (d) => d.avg_rating], ['Ratings', (d) => d.rating_count],
@@ -731,7 +735,7 @@
   ], driverRows()));
 
   $('csv-passengers').addEventListener('click', () => downloadCsv('passengers', [
-    ['Name', (p) => p.full_name], ['Email', (p) => p.email], ['Registered', (p) => p.created_at]
+    ['Name', (p) => p.full_name], ['Email', (p) => p.email], ['Mobile', (p) => p.phone], ['Registered', (p) => p.created_at]
   ], passengerRows()));
 
   $('csv-bookings').addEventListener('click', () => downloadCsv('bookings', [
