@@ -80,6 +80,17 @@ const stripPassword = (row) => {
 const normalizeEmail = (e) => String(e || '').trim().toLowerCase();
 const isEmail = (e) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e) && e.length <= 254;
 
+// Philippine mobile number. Accepts 09171234567, +639171234567, 639171234567 or 9171234567
+// (spaces, dashes and brackets are ignored). Returns the 09XXXXXXXXX form, or null when it is not valid.
+const normalizePhone = (p) => {
+    let d = String(p === undefined || p === null ? '' : p).replace(/[\s\-().]/g, '');
+    if (d.startsWith('+')) d = d.slice(1);
+    if (/^63\d{10}$/.test(d)) d = '0' + d.slice(2);
+    else if (/^9\d{9}$/.test(d)) d = '0' + d;
+    return /^09\d{9}$/.test(d) ? d : null;
+};
+const PHONE_MESSAGE = 'Please enter a valid mobile number, for example 09171234567.';
+
 // ---------------------------------------------------------------------------
 // Tokens (HS256 JWT built with Node's crypto, so no extra package is needed)
 // ---------------------------------------------------------------------------
@@ -315,11 +326,15 @@ app.post('/register', rateLimit('register', 10, 60 * 60 * 1000), async (req, res
         const email = normalizeEmail(req.body.email);
         const nameToSave = String(fullName || full_name || '').trim();
 
-        if (!nameToSave || !email || !password) {
+        if (!nameToSave || !email || !password || !String(req.body.phone || '').trim()) {
             return res.status(400).json({ success: false, message: 'All fields are required.' });
         }
         if (!isEmail(email)) {
             return res.status(400).json({ success: false, message: 'Please enter a valid email address.' });
+        }
+        const phone = normalizePhone(req.body.phone);
+        if (!phone) {
+            return res.status(400).json({ success: false, message: PHONE_MESSAGE });
         }
         if (nameToSave.length > 100) {
             return res.status(400).json({ success: false, message: 'Name is too long.' });
@@ -330,7 +345,7 @@ app.post('/register', rateLimit('register', 10, 60 * 60 * 1000), async (req, res
 
         const { error } = await supabase
             .from('passengers')
-            .insert([{ full_name: nameToSave, email, password: await hashPassword(password), email_verified: false }]);
+            .insert([{ full_name: nameToSave, email, phone, password: await hashPassword(password), email_verified: false }]);
 
         if (error) {
             console.error('PASSENGER INSERT ERROR:', error);
@@ -398,11 +413,15 @@ app.post('/driver-register', rateLimit('driver-register', 10, 60 * 60 * 1000), a
         const nameToSave = String(fullName || full_name || '').trim();
         const bodyToSave = String(bodyNumber || toda_body_number || '').trim();
 
-        if (!nameToSave || !email || !password || !bodyToSave) {
+        if (!nameToSave || !email || !password || !bodyToSave || !String(req.body.phone || '').trim()) {
             return res.status(400).json({ success: false, message: 'All fields are required.' });
         }
         if (!isEmail(email)) {
             return res.status(400).json({ success: false, message: 'Please enter a valid email address.' });
+        }
+        const phone = normalizePhone(req.body.phone);
+        if (!phone) {
+            return res.status(400).json({ success: false, message: PHONE_MESSAGE });
         }
         if (nameToSave.length > 100 || bodyToSave.length > 20) {
             return res.status(400).json({ success: false, message: 'Name or body number is too long.' });
@@ -416,6 +435,7 @@ app.post('/driver-register', rateLimit('driver-register', 10, 60 * 60 * 1000), a
             .insert([{
                 full_name: nameToSave,
                 email,
+                phone,
                 password: await hashPassword(password),
                 toda_body_number: bodyToSave,
                 is_online: false,
@@ -1296,7 +1316,7 @@ app.get('/admin/api/drivers', requireAdmin, async (req, res) => {
     try {
         const { data, error } = await supabase
             .from('drivers')
-            .select('id, full_name, email, toda_body_number, vehicle_model, plate_number, photo_status, email_verified, is_online, is_verified, verified_at, created_at')
+            .select('id, full_name, email, phone, toda_body_number, vehicle_model, plate_number, photo_status, email_verified, is_online, is_verified, verified_at, created_at')
             .order('created_at', { ascending: false });
 
         if (error) return res.status(400).json({ success: false, message: error.message });
@@ -1436,6 +1456,16 @@ app.patch('/admin/api/drivers/:id', requireAdmin, async (req, res) => {
             if (!isEmail(v)) return res.status(400).json({ success: false, message: 'Enter a valid email address.' });
             update.email = v;
         }
+        if (req.body.phone !== undefined) {
+            const raw = String(req.body.phone || '').trim();
+            if (raw === '') {
+                update.phone = null;
+            } else {
+                const v = normalizePhone(raw);
+                if (!v) return res.status(400).json({ success: false, message: PHONE_MESSAGE });
+                update.phone = v;
+            }
+        }
         if (req.body.toda_body_number !== undefined) {
             const v = cleanText(req.body.toda_body_number, 20);
             if (!v) return res.status(400).json({ success: false, message: 'Body number cannot be empty.' });
@@ -1450,7 +1480,7 @@ app.patch('/admin/api/drivers/:id', requireAdmin, async (req, res) => {
 
         const { data, error } = await supabase
             .from('drivers').update(update).eq('id', req.params.id)
-            .select('id, full_name, email, toda_body_number, vehicle_model');
+            .select('id, full_name, email, phone, toda_body_number, vehicle_model');
 
         if (error) return res.status(400).json({ success: false, message: 'Could not save. That email may already be used.' });
         if (!data || data.length === 0) return res.status(404).json({ success: false, message: 'Driver not found.' });
@@ -1488,7 +1518,7 @@ app.delete('/admin/api/drivers/:id', requireAdmin, async (req, res) => {
 app.get('/admin/api/passengers', requireAdmin, async (req, res) => {
     try {
         const { data, error } = await supabase
-            .from('passengers').select('id, full_name, email, email_verified, created_at').order('created_at', { ascending: false });
+            .from('passengers').select('id, full_name, email, phone, email_verified, created_at').order('created_at', { ascending: false });
         if (error) return res.status(400).json({ success: false, message: error.message });
         res.status(200).json({ success: true, passengers: data });
     } catch (err) {
@@ -1510,12 +1540,22 @@ app.patch('/admin/api/passengers/:id', requireAdmin, async (req, res) => {
             if (!isEmail(v)) return res.status(400).json({ success: false, message: 'Enter a valid email address.' });
             update.email = v;
         }
+        if (req.body.phone !== undefined) {
+            const raw = String(req.body.phone || '').trim();
+            if (raw === '') {
+                update.phone = null;
+            } else {
+                const v = normalizePhone(raw);
+                if (!v) return res.status(400).json({ success: false, message: PHONE_MESSAGE });
+                update.phone = v;
+            }
+        }
         if (Object.keys(update).length === 0) {
             return res.status(400).json({ success: false, message: 'Nothing to update.' });
         }
 
         const { data, error } = await supabase
-            .from('passengers').update(update).eq('id', req.params.id).select('id, full_name, email');
+            .from('passengers').update(update).eq('id', req.params.id).select('id, full_name, email, phone');
 
         if (error) return res.status(400).json({ success: false, message: 'Could not save. That email may already be used.' });
         if (!data || data.length === 0) return res.status(404).json({ success: false, message: 'Passenger not found.' });
