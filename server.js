@@ -125,6 +125,12 @@ function verifyToken(token) {
     }
 }
 
+// Ids of accounts that were deleted. A login token lasts 30 days and would still pass the signature
+// check, so every request and socket that carries one of these ids is refused. The list is filled from
+// the database when the server starts (loadRevokedIds below), so a restart does not forget it.
+const revokedIds = new Set();
+const DELETED_EMAIL_DOMAIN = 'deleted.invalid';
+
 function requireAuth(role) {
     return (req, res, next) => {
         const header = req.get('authorization') || '';
@@ -133,6 +139,9 @@ function requireAuth(role) {
 
         if (!payload || !['passenger', 'driver'].includes(payload.role)) {
             return res.status(401).json({ success: false, message: 'Please log in again.' });
+        }
+        if (revokedIds.has(String(payload.sub))) {
+            return res.status(401).json({ success: false, deleted: true, message: 'This account was deleted.' });
         }
         if (role && payload.role !== role) {
             return res.status(403).json({ success: false, message: 'This action is not allowed for your account type.' });
@@ -206,6 +215,11 @@ function requireAdmin(req, res, next) {
 // ---------------------------------------------------------------------------
 // Fare (the server is the only place that decides the price)
 // ---------------------------------------------------------------------------
+// The three numbers behind every fare. computeFare and the Help chatbot both read them from here.
+const FARE_BASE = 15.0;       // pesos for the first kilometre
+const FARE_PER_KM = 8.0;      // pesos for each kilometre after the first
+const FARE_DISCOUNT = 0.2;    // 20% off for students, senior citizens and PWDs
+
 function computeFare(origin, destination, discounted) {
     const R = 6371;
     const toRad = (deg) => deg * (Math.PI / 180);
@@ -217,10 +231,10 @@ function computeFare(origin, destination, discounted) {
         Math.sin(dLon / 2) * Math.sin(dLon / 2);
     const distanceKm = R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 
-    let baseFare = 15.0;
-    if (distanceKm > 1.0) baseFare += (distanceKm - 1.0) * 8.0;
+    let baseFare = FARE_BASE;
+    if (distanceKm > 1.0) baseFare += (distanceKm - 1.0) * FARE_PER_KM;
 
-    const totalFare = discounted ? baseFare * 0.8 : baseFare;
+    const totalFare = discounted ? baseFare * (1 - FARE_DISCOUNT) : baseFare;
 
     return {
         distanceKm: parseFloat(distanceKm.toFixed(2)),
@@ -261,6 +275,40 @@ async function sendResetEmail(toEmail, code, purpose = 'reset') {
         return true;
     } catch (err) {
         console.error('BREVO FETCH ERROR:', err.message);
+        return false;
+    }
+}
+
+const escapeHtml = (s) => String(s === undefined || s === null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+
+// A plain notice email (for example "your request was received"). Each paragraph is plain text and is
+// escaped here. It never throws: it returns true when Brevo accepted the email and false otherwise.
+async function sendNoticeEmail(toEmail, subject, paragraphs) {
+    if (!BREVO_API_KEY || !MAIL_FROM || !toEmail) {
+        console.error('NOTICE EMAIL NOT SENT: Brevo is not configured or there is no address.');
+        return false;
+    }
+
+    try {
+        const res = await fetch('https://api.brevo.com/v3/smtp/email', {
+            method: 'POST',
+            headers: { 'api-key': BREVO_API_KEY, 'content-type': 'application/json', accept: 'application/json' },
+            body: JSON.stringify({
+                sender: { name: MAIL_FROM_NAME, email: MAIL_FROM },
+                to: [{ email: toEmail }],
+                subject,
+                htmlContent: paragraphs.map((p) => `<p>${escapeHtml(p)}</p>`).join('') + '<p>Isabel-Xpress</p>'
+            })
+        });
+
+        if (!res.ok) {
+            console.error('BREVO NOTICE ERROR:', res.status, (await res.text()).slice(0, 300));
+            return false;
+        }
+        return true;
+    } catch (err) {
+        console.error('BREVO NOTICE FETCH ERROR:', err.message);
         return false;
     }
 }
@@ -1305,6 +1353,491 @@ app.get('/announcements/latest', requireAuth(), async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Deleting an account: the user asks, the administrator reviews, the user gets a notice
+// ---------------------------------------------------------------------------
+const isUuid = (s) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(s || ''));
+const REQUEST_FIELDS = 'id, status, reason, admin_note, created_at, decided_at, seen_by_user';
+
+// A passenger with a waiting or running booking, or a driver on a trip, cannot leave in the middle of it
+async function hasActiveTrip(role, id) {
+    const base = supabase.from('bookings').select('id');
+    const { data } = role === 'driver'
+        ? await base.eq('driver_id', id).eq('status', 'ACCEPTED').limit(1)
+        : await base.eq('passenger_id', id).in('status', ['PENDING', 'ACCEPTED']).limit(1);
+    return !!(data && data.length);
+}
+
+// Erases the personal details of an account but keeps the row, because trips and reports point to it.
+// The name, email, mobile number, photo and plate are removed, the password becomes a random one that
+// nobody knows, and the old login tokens stop working. Returns false when the account does not exist.
+async function eraseAccount(role, id) {
+    const table = tableFor(role);
+    const { data: acc, error: findError } = await supabase.from(table).select('id, email').eq('id', id).maybeSingle();
+    if (findError) throw new Error(findError.message);
+    if (!acc) return false;
+
+    const tag = String(id).replace(/-/g, '').slice(0, 10);
+    const placeholderEmail = `deleted-${tag}@${DELETED_EMAIL_DOMAIN}`;
+    const update = {
+        full_name: role === 'driver' ? 'Deleted driver' : 'Deleted user',
+        email: placeholderEmail,
+        phone: null,
+        password: await hashPassword(crypto.randomBytes(24).toString('hex')),
+        email_verified: false
+    };
+    if (role === 'driver') {
+        Object.assign(update, {
+            toda_body_number: 'DEL-' + tag.slice(0, 6),
+            plate_number: null,
+            vehicle_model: null,
+            photo: null,
+            photo_status: 'NONE',
+            is_online: false,
+            is_verified: false,
+            verified_at: null,
+            current_latitude: null,
+            current_longitude: null,
+            location_updated_at: null
+        });
+    }
+
+    const { error } = await supabase.from(table).update(update).eq('id', id);
+    if (error) throw new Error(error.message);
+
+    // Trip records stay (the TODA needs them and reports point to them), but without the person's name
+    const scrub = role === 'driver'
+        ? await supabase.from('bookings').update({ driver_name: 'Deleted driver', driver_body_number: null }).eq('driver_id', id)
+        : await supabase.from('bookings').update({ passenger_name: 'Deleted user', passenger_email: placeholderEmail }).eq('passenger_id', id);
+    if (scrub.error) console.error('ERASE BOOKINGS ERROR:', scrub.error.message);
+
+    await supabase.from('support_messages').delete().eq('user_id', id);
+    await supabase.from('password_resets').delete().eq('email', acc.email).eq('role', role);
+
+    // Old login tokens and open connections stop working right away
+    revokedIds.add(String(id));
+    if (role === 'driver') {
+        const socketId = driverSockets.get(id);
+        driverSockets.delete(id);
+        lastLocationWrite.delete(id);
+        io.emit('driver_offline', { driverId: id });
+        const live = socketId && io.sockets.sockets.get(socketId);
+        if (live) live.disconnect(true);
+    } else {
+        io.in(`passenger:${id}`).disconnectSockets(true);
+    }
+    return true;
+}
+
+// Called once when the server starts, so a restart does not forget who was deleted
+async function loadRevokedIds() {
+    try {
+        const { data, error } = await supabase
+            .from('deletion_requests').select('user_id').eq('status', 'APPROVED').limit(5000);
+        if (error) {
+            console.error('LOAD DELETED ACCOUNTS ERROR (did you run supabase_batch5.sql?):', error.message);
+            return;
+        }
+        for (const r of data || []) revokedIds.add(String(r.user_id));
+        console.log('Deleted accounts loaded:', revokedIds.size);
+    } catch (err) {
+        console.error('LOAD DELETED ACCOUNTS CRASH:', err.message);
+    }
+}
+
+// The newest request of the person who is logged in (the app shows its status as a notice)
+app.get('/account/delete-request', requireAuth(), async (req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('deletion_requests').select(REQUEST_FIELDS)
+            .eq('user_id', req.auth.sub).order('created_at', { ascending: false }).limit(1);
+        if (error) return res.status(400).json({ success: false, message: 'Could not load your request.' });
+        res.status(200).json({ success: true, request: data && data.length ? data[0] : null });
+    } catch (err) {
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
+app.post('/account/delete-request', requireAuth(), rateLimit('delreq', 10, 60 * 60 * 1000), async (req, res) => {
+    try {
+        const role = req.auth.role;
+        const table = tableFor(role);
+        const password = String(req.body.password || '');
+        const reason = cleanText(req.body.reason, 300);
+
+        if (!password) {
+            return res.status(400).json({ success: false, message: 'Enter your password to confirm.' });
+        }
+
+        const { data: user } = await supabase.from(table).select('*').eq('id', req.auth.sub).maybeSingle();
+        if (!user) return res.status(401).json({ success: false, message: 'Please log in again.' });
+
+        // 403 and not 401, because the app logs the user out when it gets a 401
+        if (!(await verifyPassword(table, user, password))) {
+            return res.status(403).json({ success: false, message: 'That password is not correct.' });
+        }
+
+        if (await hasActiveTrip(role, user.id)) {
+            return res.status(409).json({
+                success: false,
+                message: role === 'driver'
+                    ? 'Finish your current trip first, then send the request.'
+                    : 'Finish or cancel your current booking first, then send the request.'
+            });
+        }
+
+        const { data, error } = await supabase.from('deletion_requests').insert([{
+            role,
+            user_id: user.id,
+            user_name: user.full_name,
+            user_email: user.email,
+            user_phone: user.phone || null,
+            reason: reason || null
+        }]).select(REQUEST_FIELDS).single();
+
+        if (error) {
+            // The database allows only one waiting request for each account
+            if (error.code === '23505') {
+                return res.status(409).json({ success: false, message: 'You already have a request waiting for review.' });
+            }
+            console.error('DELETION REQUEST INSERT ERROR:', error);
+            return res.status(400).json({ success: false, message: 'Could not send your request. Please try again.' });
+        }
+
+        // The email is a notice only; the request is already saved, so the user does not wait for it
+        sendNoticeEmail(user.email, 'We received your account deletion request', [
+            `Hello ${user.full_name},`,
+            'We received your request to delete your Isabel-Xpress account. The administrator will review it, and we will email you the decision.',
+            'Until then your account stays active. You can cancel the request from Profile in the app.',
+            'If you did not send this request, change your password and tell the administrator through Help & support.'
+        ]);
+
+        res.status(200).json({
+            success: true,
+            message: 'Request sent. The administrator will review it and you will get a notice.',
+            request: data
+        });
+    } catch (err) {
+        console.error('DELETION REQUEST ERROR:', err);
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
+app.post('/account/delete-request/cancel', requireAuth(), async (req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('deletion_requests')
+            .update({ status: 'CANCELLED', decided_at: new Date().toISOString(), seen_by_user: true })
+            .eq('user_id', req.auth.sub).eq('status', 'PENDING').select(REQUEST_FIELDS);
+        if (error) return res.status(400).json({ success: false, message: 'Could not cancel the request.' });
+        if (!data || data.length === 0) {
+            return res.status(409).json({ success: false, message: 'There is no waiting request to cancel.' });
+        }
+        res.status(200).json({ success: true, message: 'Request cancelled. Your account stays active.', request: data[0] });
+    } catch (err) {
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
+// The user has read the decision, so the notice is not shown again
+app.post('/account/delete-request/ack', requireAuth(), async (req, res) => {
+    try {
+        await supabase.from('deletion_requests').update({ seen_by_user: true })
+            .eq('user_id', req.auth.sub).neq('status', 'PENDING');
+        res.status(200).json({ success: true });
+    } catch (err) {
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
+// ---------------------------------------------------------------------------
+// Chat with the administrator (support messages). The app reads new replies by asking again every few seconds.
+// ---------------------------------------------------------------------------
+app.get('/support/messages', requireAuth(), async (req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('support_messages').select('id, sender, message, created_at')
+            .eq('user_id', req.auth.sub).order('created_at', { ascending: false }).limit(100);
+        if (error) return res.status(400).json({ success: false, message: 'Could not load the chat.' });
+
+        // The user is looking at the chat, so the administrator's replies count as read
+        supabase.from('support_messages').update({ read_by_user: true })
+            .eq('user_id', req.auth.sub).eq('sender', 'ADMIN').eq('read_by_user', false)
+            .then(({ error: markError }) => { if (markError) console.error('SUPPORT MARK READ ERROR:', markError.message); });
+
+        res.status(200).json({ success: true, messages: (data || []).reverse() });
+    } catch (err) {
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
+app.get('/support/unread', requireAuth(), async (req, res) => {
+    try {
+        const { count, error } = await supabase
+            .from('support_messages').select('id', { count: 'exact', head: true })
+            .eq('user_id', req.auth.sub).eq('sender', 'ADMIN').eq('read_by_user', false);
+        if (error) return res.status(400).json({ success: false, message: 'Could not check messages.' });
+        res.status(200).json({ success: true, unread: count || 0 });
+    } catch (err) {
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
+app.post('/support/messages', requireAuth(), rateLimit('support', 40, 60 * 60 * 1000), async (req, res) => {
+    try {
+        const message = cleanText(req.body.message, 500);
+        if (!message) return res.status(400).json({ success: false, message: 'Type a message first.' });
+
+        const { data, error } = await supabase.from('support_messages').insert([{
+            role: req.auth.role,
+            user_id: req.auth.sub,
+            user_name: cleanText(req.auth.name, 100) || null,
+            sender: 'USER',
+            message,
+            read_by_admin: false,
+            read_by_user: true
+        }]).select('id, sender, message, created_at').single();
+
+        if (error) {
+            console.error('SUPPORT INSERT ERROR:', error);
+            return res.status(400).json({ success: false, message: 'Could not send your message.' });
+        }
+        res.status(200).json({ success: true, message: 'Sent', item: data });
+    } catch (err) {
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
+// ---------------------------------------------------------------------------
+// Help chatbot. It answers from a fixed list of topics (no outside AI service), so the answers
+// always match how the system really works. Fare numbers come from the same constants as computeFare.
+// ---------------------------------------------------------------------------
+const peso = (n) => '₱' + n.toFixed(2);
+const sampleFare = (km, discounted) => {
+    const base = FARE_BASE + (km > 1 ? (km - 1) * FARE_PER_KM : 0);
+    return discounted ? base * (1 - FARE_DISCOUNT) : base;
+};
+const DISCOUNT_PERCENT = Math.round(FARE_DISCOUNT * 100);
+const BOTH = ['passenger', 'driver'];
+
+// How a question is matched to a topic (see matchFaq below):
+//   keywords  = weak words, 1 point each (2 for a phrase)      strong = clear intent words, 3 points each
+//   patterns  = regular expressions for things a word list cannot say, 5 points each
+// A word of 3 letters or fewer must match a whole word; a longer word matches the start of a word.
+// When two topics tie, the one listed first wins.
+const FAQ = [
+    {
+        id: 'book', roles: ['passenger'], title: 'How do I book a ride?',
+        strong: ['book a ride', 'how to book', 'how do i book', 'make a booking'],
+        keywords: ['book', 'ride', 'pickup', 'pick up', 'order', 'reserve', 'request a ride', 'how to use', 'sakay', 'magpa'],
+        answer: `Choose your pickup and your destination, then tap Calculate fare. Check the fare and tap Confirm booking. Then wait for a driver to accept. You can have one active booking at a time, and a booking that nobody accepts is cancelled after ${PENDING_EXPIRY_MINUTES} minutes.`
+    },
+    {
+        id: 'fare', roles: ['passenger', 'driver'], title: 'How is the fare computed?',
+        strong: ['fare', 'how much', 'magkano', 'tagpira', 'pila', 'presyo'],
+        keywords: ['price', 'cost', 'rate', 'charge', 'kilometer', 'kilometre', 'km', 'distance', 'expensive'],
+        answer: `The fare is ${peso(FARE_BASE)} for the first kilometre plus ${peso(FARE_PER_KM)} for each extra kilometre. The distance is measured in a straight line between the pickup and the destination. Example: 3 km costs ${peso(sampleFare(3, false))}. The server calculates the fare, so the app cannot change it.`
+    },
+    {
+        id: 'discount', roles: ['passenger'], title: 'Who gets the discount?',
+        strong: ['discount', 'student', 'senior', 'pwd', 'diskwento', 'bawas'],
+        keywords: ['disabled', 'id'],
+        answer: `Students, senior citizens and PWDs get ${DISCOUNT_PERCENT}% off. Tick the discount box before you tap Calculate fare. Example: 3 km costs ${peso(sampleFare(3, true))} with the discount. The app does not check IDs, so tick the box only if you qualify, and keep your ID with you.`
+    },
+    {
+        id: 'cancel', roles: ['passenger'], title: 'Can I cancel my booking?',
+        strong: ['cancel', 'kansela'],
+        keywords: ['undo', 'wrong booking', 'mistake', 'stop booking'],
+        patterns: [/\b(delete|remove)\b.*\b(booking|ride|trip)\b/],
+        answer: `Yes. While your booking is waiting, or after a driver accepted it, tap Cancel booking. A booking that nobody accepts is cancelled automatically after ${PENDING_EXPIRY_MINUTES} minutes.`
+    },
+    {
+        id: 'no_driver', roles: ['passenger'], title: 'No driver is accepting my booking',
+        strong: ['no driver', 'nobody accepts', 'no one accepts', 'not accepting', 'taking long', 'matagal'],
+        keywords: ['nobody', 'no one', 'waiting', 'how long', 'walay', 'wala'],
+        answer: `Your booking goes to every verified driver who is online. If nobody accepts it within ${PENDING_EXPIRY_MINUTES} minutes it is cancelled, and you can book again. Try again in a few minutes. If it keeps happening, tell the administrator through Help & support.`
+    },
+    {
+        id: 'verify_driver', roles: ['passenger'], title: 'How do I know my driver is real?',
+        strong: ['qr', 'fake', 'legit', 'real driver', 'verify driver', 'scan driver'],
+        keywords: ['real', 'trust', 'identity', 'scan', 'plate', 'photo', 'body number'],
+        answer: 'After a driver accepts, check the name, photo, TODA body number and plate number shown on your trip. For a stronger check tap Scan driver QR and scan the code on the driver\'s phone (it lasts 5 minutes). Passengers only see photos that the administrator approved. If the details do not match, do not ride, cancel the booking and report the driver.'
+    },
+    {
+        id: 'safety', roles: ['passenger'], title: 'What if I feel unsafe?',
+        strong: ['emergency', 'sos', 'unsafe', 'safety', '911', 'police', 'share trip'],
+        keywords: ['safe', 'danger', 'scared', 'takot', 'tabang'],
+        answer: 'Tap Emergency to call 911 or to text your saved emergency contact your trip details. Tap Share trip (safety) to send your trip details to someone you trust. After the trip you can report the driver.'
+    },
+    {
+        id: 'payment', roles: ['passenger'], title: 'How do I pay?',
+        strong: ['payment', 'gcash', 'paymaya', 'cash', 'bayad'],
+        keywords: ['pay', 'paying', 'card', 'change'],
+        answer: 'Payment is in cash, paid to the driver after the trip. The app does not take online payments.'
+    },
+    {
+        id: 'rate_report', roles: ['passenger'], title: 'How do I rate or report a driver?',
+        strong: ['report', 'rating', 'rate my', 'rate the', 'rate a', 'rate driver', 'complain', 'complaint', 'reklamo', 'overcharge'],
+        keywords: ['rate', 'review', 'rude', 'star', 'feedback'],
+        answer: 'When a trip is completed you can rate the driver from 1 to 5 stars. To report a problem tap Report driver (after the trip or in Trip history) and choose a reason: wrong fare, rude or unsafe driving, details that did not match, or other. The administrator reviews every report.'
+    },
+    {
+        id: 'history', roles: ['passenger'], title: 'Where is my trip history?',
+        strong: ['history', 'past trips', 'previous trips', 'receipt'],
+        keywords: ['past trip', 'previous', 'old booking', 'my trips'],
+        answer: 'Tap your round profile button at the top of the map, then tap Trip history. There you can also share a receipt or report a driver.'
+    },
+    {
+        id: 'chat_driver', roles: ['passenger'], title: 'How do I chat with my driver?',
+        strong: ['chat with driver', 'chat with my driver', 'message driver', 'message my driver', 'talk to driver', 'talk to my driver', 'text driver', 'contact driver', 'call driver'],
+        keywords: ['chat', 'usap'],
+        answer: 'When a driver accepts your booking, tap Chat with driver on the trip screen. Trip chat messages are not saved, and the chat ends with the trip. For other questions, use Help & support in Profile to chat with the administrator.'
+    },
+    {
+        id: 'd_register', roles: BOTH, title: 'How do I become a verified driver?',
+        strong: ['become a driver', 'become driver', 'register as driver', 'driver registration', 'sign up as driver', 'verified driver', 'get verified', 'body number', 'toda'],
+        keywords: ['register', 'sign up', 'apply', 'join', 'verified', 'verification'],
+        answer: 'Register as a driver with your name, email, mobile number, password and TODA body number, then type the 6-digit code sent to your email. The administrator checks your body number against the TODA list and verifies you. You can log in only after that. After your first login, add your face photo and plate number in Profile & QR.'
+    },
+    {
+        id: 'd_online', roles: ['driver'], title: 'How do I get bookings?',
+        strong: ['go online', 'online', 'offline', 'not receiving', 'no bookings', 'no booking', 'walang booking', 'accept booking'],
+        keywords: ['receive', 'get booking', 'accept', 'request'],
+        answer: 'Switch Online on the dashboard and keep the app open, so your location is shared. New bookings appear on your dashboard, and you tap Accept Booking. You can have one trip at a time, so finish the current trip first. Only verified drivers can go online.'
+    },
+    {
+        id: 'd_complete', roles: ['driver'], title: 'How do I finish a trip?',
+        strong: ['complete trip', 'complete the trip', 'finish trip', 'end trip', 'drop off', 'dropoff'],
+        keywords: ['complete', 'finish', 'done'],
+        answer: 'After you drop the passenger off, tap Complete trip. Collect the fare in cash. The trip is then counted in your earnings.'
+    },
+    {
+        id: 'd_earnings', roles: ['driver'], title: 'Where are my earnings?',
+        strong: ['earning', 'earnings', 'income', 'kita'],
+        keywords: ['total', 'today', 'this week', 'weekly', 'daily'],
+        answer: 'The dashboard shows two tiles, TODAY and THIS WEEK. Each shows your completed trips and the cash fares collected. Days use Philippine time and the week starts on Monday.'
+    },
+    {
+        id: 'd_qr', roles: ['driver'], title: 'How do I show my QR code?',
+        strong: ['qr', 'qr code', 'show qr', 'my qr'],
+        keywords: ['identity'],
+        answer: 'Tap Profile & QR and show the QR code. A passenger scans it with Scan driver QR to confirm who you are. The code lasts 5 minutes and refreshes itself. Only verified drivers get a QR code.'
+    },
+    {
+        id: 'd_photo', roles: ['driver'], title: 'Why is my photo not showing?',
+        strong: ['photo', 'picture', 'larawan', 'plate number', 'plate'],
+        keywords: ['upload', 'approved', 'rejected'],
+        answer: 'A new photo waits for the administrator to approve it, and passengers only see approved photos. If it was rejected, upload a clearer face photo in Profile & QR. You add your plate number on the same screen.'
+    },
+    {
+        id: 'password', roles: BOTH, title: 'I forgot my password',
+        strong: ['password', 'forgot', 'forget', 'nakalimutan', 'cannot login', 'can\'t login', 'cant login', 'login problem', 'invalid credentials', 'reset'],
+        keywords: ['change password', 'limot', 'log in', 'login'],
+        answer: 'On the login screen tap Forgot Password?, enter your email, and type the 6-digit code that we email you (it lasts 10 minutes). Then choose a new password: at least 12 characters with a number, a capital letter and a special character (@#$%^&+=!_).'
+    },
+    {
+        id: 'email_code', roles: BOTH, title: 'I did not get the email code',
+        strong: ['email code', 'verification code', 'verify email', 'not received', 'no email', 'resend', 'otp', '6-digit', 'did not get', 'did not receive', 'spam'],
+        keywords: ['code', 'verify'],
+        answer: 'Check your spam folder, then tap Resend code. The code lasts 10 minutes and you have 5 tries. Make sure you typed your email correctly when you registered. If it still does not arrive, tell the administrator through Help & support.'
+    },
+    {
+        id: 'delete_account', roles: BOTH, title: 'How do I delete my account?',
+        strong: ['delete', 'burahin', 'tanggalin', 'deactivate', 'erase', 'remove my data', 'close account', 'remove account'],
+        keywords: [],
+        patterns: [/\b(delete|remove|close|erase|deactivate|cancel)\b.*\baccount\b/, /\baccount\b.*\b(delete|remove|close|erase|deactivate|cancel)\b/],
+        answer: 'Open Profile and tap Delete my account, enter your password and send the request. The administrator reviews it, and you get a notice in the app and by email. You cannot send it while you have an active booking or trip. If it is approved, your name, email, mobile number and login are erased. Past trip records stay without your name.'
+    },
+    {
+        id: 'privacy', roles: BOTH, title: 'What information do you keep?',
+        strong: ['privacy', 'personal data', 'personal information', 'what data', 'my data', 'track', 'tracking'],
+        keywords: ['data', 'information', 'store', 'location', 'secure', 'private', 'keep my'],
+        answer: 'Passengers: name, email, mobile number and trip records (pickup, destination, fare, rating). Drivers: also the TODA body number, plate number and face photo, and the live location while Online. Passwords are stored scrambled, so nobody can read them. You can ask for your account to be deleted any time from Profile.'
+    },
+    {
+        id: 'contact', roles: BOTH, title: 'How do I contact the administrator?',
+        strong: ['contact', 'admin', 'administrator', 'support', 'customer service', 'human', 'talk to'],
+        keywords: ['help', 'person', 'staff', 'message admin', 'phone number'],
+        answer: 'Open Profile, tap Help & support, then Chat with the administrator. Type your message and the administrator replies in the same chat. Replies are not instant, so check back later.'
+    },
+    {
+        id: 'about', roles: BOTH, title: 'What is Isabel-Xpress?',
+        strong: ['isabel-xpress', 'isabel xpress', 'isabel express'],
+        keywords: ['about', 'purpose', 'who made', 'this app'],
+        answer: 'Isabel-Xpress is a booking and driver-identification app for e-racals and pedicabs in Isabel, Leyte. Passengers book a ride at a fare set by the system and can check that the driver is a verified TODA member.'
+    },
+    // The two below are not in the topic list; they only answer a greeting or a thank-you.
+    // They come last so a real question always beats them.
+    {
+        id: 'hello', roles: BOTH, hidden: true, title: 'Hello',
+        keywords: ['hello', 'hi', 'hey', 'good morning', 'good afternoon', 'good evening', 'kumusta', 'musta'],
+        answer: 'Hello! I am the Isabel-Xpress help bot. Tap a topic below or type your question.'
+    },
+    {
+        id: 'thanks', roles: BOTH, hidden: true, title: 'Thanks',
+        keywords: ['thank', 'thanks', 'salamat', 'ok', 'okay'],
+        answer: 'You are welcome! Tap a topic or type another question if you need more help.'
+    }
+];
+
+const topicsFor = (role) => FAQ.filter((f) => !f.hidden && f.roles.includes(role)).map((f) => ({ id: f.id, title: f.title }));
+
+const needle = (k) => ' ' + k + (k.length <= 3 ? ' ' : '');
+
+function scoreFaq(f, q) {
+    let score = 0;
+    for (const k of f.keywords || []) if (q.includes(needle(k))) score += k.includes(' ') ? 2 : 1;
+    for (const k of f.strong || []) if (q.includes(needle(k))) score += 3;
+    for (const re of f.patterns || []) if (re.test(q)) score += 5;
+    return score;
+}
+
+function matchFaq(question, role) {
+    const q = ' ' + String(question || '').toLowerCase().replace(/[^a-z0-9'\-%\s]/g, ' ').replace(/\s+/g, ' ').trim() + ' ';
+    let best = null;
+    let bestScore = 0;
+    for (const f of FAQ) {
+        if (!f.roles.includes(role)) continue;
+        const score = scoreFaq(f, q);
+        if (score > bestScore) { best = f; bestScore = score; }
+    }
+    return best;
+}
+
+app.get('/assistant/topics', requireAuth(), (req, res) => {
+    res.status(200).json({ success: true, topics: topicsFor(req.auth.role) });
+});
+
+app.post('/assistant', requireAuth(), rateLimit('assistant', 120, 60 * 60 * 1000), (req, res) => {
+    const role = req.auth.role;
+    const topicId = String(req.body.topic || '');
+    const question = cleanText(req.body.question, 200);
+
+    let found = topicId ? FAQ.find((f) => f.id === topicId && f.roles.includes(role)) : null;
+    if (!found && question) found = matchFaq(question, role);
+    if (!found && !topicId && !question) {
+        return res.status(400).json({ success: false, message: 'Type a question or pick a topic.' });
+    }
+
+    if (!found) {
+        return res.status(200).json({
+            success: true,
+            topic: null,
+            handoff: true,
+            answer: 'I do not have an answer for that yet. Pick one of the topics below, or open Help & support and chat with the administrator.',
+            suggestions: topicsFor(role).slice(0, 6)
+        });
+    }
+
+    res.status(200).json({
+        success: true,
+        topic: found.id,
+        handoff: false,
+        answer: found.answer,
+        suggestions: found.hidden ? topicsFor(role).slice(0, 6) : []
+    });
+});
+
+// ---------------------------------------------------------------------------
 // Administrator
 // ---------------------------------------------------------------------------
 app.get('/admin', (req, res) => {
@@ -1317,6 +1850,7 @@ app.get('/admin/api/drivers', requireAdmin, async (req, res) => {
         const { data, error } = await supabase
             .from('drivers')
             .select('id, full_name, email, phone, toda_body_number, vehicle_model, plate_number, photo_status, email_verified, is_online, is_verified, verified_at, created_at')
+            .not('email', 'like', '%@' + DELETED_EMAIL_DOMAIN)
             .order('created_at', { ascending: false });
 
         if (error) return res.status(400).json({ success: false, message: error.message });
@@ -1507,6 +2041,7 @@ app.delete('/admin/api/drivers/:id', requireAdmin, async (req, res) => {
         if (!data || data.length === 0) return res.status(404).json({ success: false, message: 'Driver not found.' });
 
         driverSockets.delete(req.params.id);
+        revokedIds.add(String(req.params.id));
         io.emit('driver_offline', { driverId: req.params.id });
         logAdmin('DRIVER_DELETED', req.params.id);
         res.status(200).json({ success: true, message: 'Driver deleted' });
@@ -1518,7 +2053,9 @@ app.delete('/admin/api/drivers/:id', requireAdmin, async (req, res) => {
 app.get('/admin/api/passengers', requireAdmin, async (req, res) => {
     try {
         const { data, error } = await supabase
-            .from('passengers').select('id, full_name, email, phone, email_verified, created_at').order('created_at', { ascending: false });
+            .from('passengers').select('id, full_name, email, phone, email_verified, created_at')
+            .not('email', 'like', '%@' + DELETED_EMAIL_DOMAIN)
+            .order('created_at', { ascending: false });
         if (error) return res.status(400).json({ success: false, message: error.message });
         res.status(200).json({ success: true, passengers: data });
     } catch (err) {
@@ -1580,6 +2117,7 @@ app.delete('/admin/api/passengers/:id', requireAdmin, async (req, res) => {
             return res.status(409).json({ success: false, message: 'This passenger has trip or report records and cannot be deleted.' });
         }
         if (!data || data.length === 0) return res.status(404).json({ success: false, message: 'Passenger not found.' });
+        revokedIds.add(String(req.params.id));
         logAdmin('PASSENGER_DELETED', req.params.id);
         res.status(200).json({ success: true, message: 'Passenger deleted' });
     } catch (err) {
@@ -1686,6 +2224,232 @@ app.delete('/admin/api/announcements/:id', requireAdmin, async (req, res) => {
         const { error } = await supabase.from('announcements').delete().eq('id', req.params.id);
         if (error) return res.status(400).json({ success: false, message: 'Could not delete.' });
         res.status(200).json({ success: true, message: 'Announcement deleted' });
+    } catch (err) {
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
+// ---- Admin: account deletion requests and support chat ----
+
+app.get('/admin/api/deletion-requests', requireAdmin, async (req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('deletion_requests').select('*').order('created_at', { ascending: false }).limit(200);
+        if (error) return res.status(400).json({ success: false, message: 'Could not load the requests. Did you run supabase_batch5.sql?' });
+
+        // Facts that help the administrator decide, for the requests that are still waiting
+        const waiting = (data || []).filter((r) => r.status === 'PENDING');
+        const passengerIds = waiting.filter((r) => r.role === 'passenger').map((r) => r.user_id);
+        const driverIds = waiting.filter((r) => r.role === 'driver').map((r) => r.user_id);
+        const facts = {};
+        const fact = (id) => facts[id] || (facts[id] = { trips: 0, active: false, open_reports: 0 });
+
+        if (passengerIds.length) {
+            const { data: rows } = await supabase
+                .from('bookings').select('passenger_id, status').in('passenger_id', passengerIds).limit(5000);
+            for (const b of rows || []) {
+                const f = fact(b.passenger_id);
+                if (b.status === 'COMPLETED') f.trips += 1;
+                if (b.status === 'PENDING' || b.status === 'ACCEPTED') f.active = true;
+            }
+        }
+        if (driverIds.length) {
+            const { data: rows } = await supabase
+                .from('bookings').select('driver_id, status').in('driver_id', driverIds).limit(5000);
+            for (const b of rows || []) {
+                const f = fact(b.driver_id);
+                if (b.status === 'COMPLETED') f.trips += 1;
+                if (b.status === 'ACCEPTED') f.active = true;
+            }
+            const { data: reps } = await supabase
+                .from('reports').select('driver_id').in('driver_id', driverIds).eq('status', 'OPEN');
+            for (const r of reps || []) fact(r.driver_id).open_reports += 1;
+        }
+
+        const requests = (data || []).map((r) => {
+            const f = facts[r.user_id];
+            return { ...r, trips: f ? f.trips : 0, has_active_trip: f ? f.active : false, open_reports: f ? f.open_reports : 0 };
+        });
+        res.status(200).json({ success: true, requests });
+    } catch (err) {
+        console.error('DELETION LIST ERROR:', err);
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
+app.post('/admin/api/deletion-requests/:id/decide', requireAdmin, async (req, res) => {
+    try {
+        if (!isUuid(req.params.id)) return res.status(404).json({ success: false, message: 'Request not found.' });
+
+        const approve = req.body.approve === true;
+        const note = cleanText(req.body.note, 300);
+        if (!approve && !note) {
+            return res.status(400).json({ success: false, message: 'Write a short reason, so the user knows why the request was declined.' });
+        }
+
+        const { data: found } = await supabase
+            .from('deletion_requests').select('*').eq('id', req.params.id).maybeSingle();
+        if (!found) return res.status(404).json({ success: false, message: 'Request not found.' });
+        if (found.status !== 'PENDING') {
+            return res.status(409).json({ success: false, message: 'This request was already decided.' });
+        }
+
+        if (approve && (await hasActiveTrip(found.role, found.user_id))) {
+            return res.status(409).json({
+                success: false,
+                message: 'This person has an active booking or trip. Cancel it from the Bookings tab first, or decline the request.'
+            });
+        }
+
+        // Claim the request first, so two clicks cannot run the deletion twice
+        const { data: claimed, error: claimError } = await supabase
+            .from('deletion_requests')
+            .update({
+                status: approve ? 'APPROVED' : 'REJECTED',
+                admin_note: note || null,
+                decided_at: new Date().toISOString(),
+                seen_by_user: false
+            })
+            .eq('id', found.id).eq('status', 'PENDING').select('id');
+        if (claimError) return res.status(400).json({ success: false, message: 'Could not save the decision.' });
+        if (!claimed || claimed.length === 0) {
+            return res.status(409).json({ success: false, message: 'This request was already decided.' });
+        }
+
+        const who = found.role + ' ' + String(found.user_id).slice(0, 8);
+        const greeting = `Hello ${found.user_name || 'there'},`;
+
+        if (!approve) {
+            logAdmin('DELETION_DECLINED', who);
+            const mailed = await sendNoticeEmail(found.user_email, 'Your account deletion request', [
+                greeting,
+                'The administrator reviewed your request to delete your Isabel-Xpress account and did not approve it.',
+                'Reason: ' + note,
+                'Your account stays active. You can send a new request from Profile in the app, or chat with the administrator through Help & support.'
+            ]);
+            return res.status(200).json({
+                success: true,
+                message: mailed ? 'Request declined. The user was notified in the app and by email.' : 'Request declined. The user will see the notice in the app (the email could not be sent).'
+            });
+        }
+
+        try {
+            await eraseAccount(found.role, found.user_id);
+        } catch (err) {
+            console.error('ERASE ACCOUNT ERROR:', err.message);
+            // Put the request back, so the administrator can try again
+            await supabase.from('deletion_requests')
+                .update({ status: 'PENDING', admin_note: null, decided_at: null }).eq('id', found.id);
+            return res.status(500).json({ success: false, message: 'Could not erase the account. The request is still waiting. Please try again.' });
+        }
+
+        // The details are gone from the account, so they are removed from the request record too
+        await supabase.from('deletion_requests').update({
+            user_name: found.role === 'driver' ? 'Deleted driver' : 'Deleted user',
+            user_email: null,
+            user_phone: null
+        }).eq('id', found.id);
+
+        logAdmin('DELETION_APPROVED', who);
+        const mailed = await sendNoticeEmail(found.user_email, 'Your Isabel-Xpress account was deleted', [
+            greeting,
+            'The administrator approved your request. Your Isabel-Xpress account has been deleted. Your name, email address, mobile number and login were erased' +
+                (found.role === 'driver' ? ', together with your photo and plate number.' : '.'),
+            'Past trip records are kept without your name, so the TODA can keep its records and review any report.',
+            'Thank you for using Isabel-Xpress.'
+        ]);
+        res.status(200).json({
+            success: true,
+            message: mailed ? 'Account deleted. The user was notified by email.' : 'Account deleted. The email notice could not be sent (check BREVO_API_KEY and MAIL_FROM on Render).'
+        });
+    } catch (err) {
+        console.error('DELETION DECIDE ERROR:', err);
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
+app.get('/admin/api/support/threads', requireAdmin, async (req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('support_messages')
+            .select('id, role, user_id, user_name, sender, message, created_at, read_by_admin')
+            .order('created_at', { ascending: false }).limit(500);
+        if (error) return res.status(400).json({ success: false, message: 'Could not load the messages. Did you run supabase_batch5.sql?' });
+
+        // Newest message first, so the first row seen for each user is that conversation's last message
+        const threads = new Map();
+        for (const m of data || []) {
+            let t = threads.get(m.user_id);
+            if (!t) {
+                t = {
+                    user_id: m.user_id, role: m.role, user_name: m.user_name,
+                    last_message: m.message, last_sender: m.sender, last_at: m.created_at, unread: 0
+                };
+                threads.set(m.user_id, t);
+            }
+            if (m.sender === 'USER' && !m.read_by_admin) t.unread += 1;
+        }
+        res.status(200).json({ success: true, threads: [...threads.values()] });
+    } catch (err) {
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
+app.get('/admin/api/support/thread/:userId', requireAdmin, async (req, res) => {
+    try {
+        if (!isUuid(req.params.userId)) return res.status(404).json({ success: false, message: 'Conversation not found.' });
+
+        const { data, error } = await supabase
+            .from('support_messages').select('id, role, user_name, sender, message, created_at')
+            .eq('user_id', req.params.userId).order('created_at', { ascending: false }).limit(200);
+        if (error) return res.status(400).json({ success: false, message: 'Could not load the conversation.' });
+
+        // The administrator is reading it, so the user's messages count as read
+        supabase.from('support_messages').update({ read_by_admin: true })
+            .eq('user_id', req.params.userId).eq('sender', 'USER').eq('read_by_admin', false)
+            .then(({ error: markError }) => { if (markError) console.error('SUPPORT MARK READ ERROR:', markError.message); });
+
+        res.status(200).json({ success: true, messages: (data || []).reverse() });
+    } catch (err) {
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
+app.post('/admin/api/support/thread/:userId/reply', requireAdmin, async (req, res) => {
+    try {
+        const userId = req.params.userId;
+        if (!isUuid(userId)) return res.status(404).json({ success: false, message: 'Conversation not found.' });
+
+        const message = cleanText(req.body.message, 500);
+        if (!message) return res.status(400).json({ success: false, message: 'Type a reply first.' });
+
+        const { data: last } = await supabase
+            .from('support_messages').select('role, user_name')
+            .eq('user_id', userId).eq('sender', 'USER').order('created_at', { ascending: false }).limit(1);
+        if (!last || last.length === 0) {
+            return res.status(404).json({ success: false, message: 'This person has not written to you.' });
+        }
+
+        const { data, error } = await supabase.from('support_messages').insert([{
+            role: last[0].role,
+            user_id: userId,
+            user_name: last[0].user_name,
+            sender: 'ADMIN',
+            message,
+            read_by_admin: true,
+            read_by_user: false
+        }]).select('id, sender, message, created_at').single();
+        if (error) return res.status(400).json({ success: false, message: 'Could not send the reply.' });
+
+        // A short signal, so an app that is open can refresh at once (the app also checks on its own)
+        if (last[0].role === 'driver') {
+            const socketId = driverSockets.get(userId);
+            if (socketId) io.to(socketId).emit('support_reply', { id: data.id });
+        } else {
+            io.to(`passenger:${userId}`).emit('support_reply', { id: data.id });
+        }
+
+        res.status(200).json({ success: true, message: 'Reply sent', item: data });
     } catch (err) {
         res.status(500).json({ success: false, message: 'Server error.' });
     }
@@ -1798,6 +2562,7 @@ io.use((socket, next) => {
     const token = socket.handshake.auth && socket.handshake.auth.token;
     const payload = verifyToken(token);
     if (!payload || !['passenger', 'driver'].includes(payload.role)) return next(new Error('unauthorized'));
+    if (revokedIds.has(String(payload.sub))) return next(new Error('unauthorized'));
     socket.data.auth = payload;
     socket.data.bookingRooms = new Set();
     next();
@@ -1937,4 +2702,5 @@ io.on('connection', (socket) => {
 const PORT = process.env.PORT || 10000;
 server.listen(PORT, '0.0.0.0', () => {
     console.log(`Server running on port ${PORT}`);
+    loadRevokedIds();
 });
