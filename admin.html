@@ -107,6 +107,23 @@
   .hbar .fill { background: var(--bar-info); height: 100%; border-radius: 999px; }
   #toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); background: #0e2a26; color: #fff;
            padding: 12px 20px; border-radius: 14px; font-size: .9rem; display: none; max-width: 90%; z-index: 20; box-shadow: 0 10px 30px rgba(0,0,0,.25); }
+  .muted.small { font-size: .8rem; }
+  .support { display: grid; grid-template-columns: 300px 1fr; gap: 16px; margin-top: 14px; }
+  .thread { display: block; width: 100%; text-align: left; font-weight: 400; background: var(--card); color: var(--text);
+            border: 1px solid var(--line); border-radius: 14px; padding: 10px 12px; margin-bottom: 8px; }
+  .thread.active { border-color: var(--primary); background: var(--soft); }
+  .thread .top { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+  .thread .last { margin-top: 4px; font-size: .85rem; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .convhead { font-size: 1rem; margin: 0 0 8px; min-height: 1.4em; }
+  .bubbles { height: 340px; overflow-y: auto; padding: 10px; background: var(--bg); border: 1px solid var(--line);
+             border-radius: 14px; display: flex; flex-direction: column; gap: 8px; }
+  .bubble { max-width: 80%; padding: 8px 12px; border-radius: 14px; white-space: pre-wrap; word-break: break-word; }
+  .bubble.them { align-self: flex-start; background: var(--card); border: 1px solid var(--line); }
+  .bubble.me { align-self: flex-end; background: var(--primary); color: var(--primary-text); }
+  .bubble .when { font-size: .7rem; opacity: .7; margin-top: 2px; }
+  .replybox { display: flex; gap: 8px; align-items: flex-end; margin-top: 10px; }
+  .replybox textarea { flex: 1; }
+  @media (max-width: 800px) { .support { grid-template-columns: 1fr; } }
   @media (max-width: 700px) { main { padding: 16px 14px 40px; } header { padding: 14px 16px; } }
 </style>
 </head>
@@ -211,6 +228,41 @@
       <div class="table-wrap"><table id="announcementsTable"></table></div>
     </div>
 
+    <div id="panel-deletions" class="card" hidden>
+      <h2>Account deletion requests</h2>
+      <p class="muted">Passengers and drivers can ask to delete their account from the app. Read the reason, check the records, then approve or decline. Approving erases the person's name, email, mobile number and login right away (drivers also lose the photo and plate number). Trip records stay, without the name. The person gets a notice in the app and by email, whatever you decide.</p>
+      <p id="deletionsNote" class="error" role="alert"></p>
+      <div class="toolbar">
+        <input id="search-deletions" type="search" placeholder="Search name, email or reason">
+        <label for="deletionFilter" style="margin:0">Show</label>
+        <select id="deletionFilter">
+          <option value="PENDING">Waiting for review</option>
+          <option value="ALL">All requests</option>
+          <option value="APPROVED">Deleted</option>
+          <option value="REJECTED">Declined</option>
+          <option value="CANCELLED">Cancelled by the user</option>
+        </select>
+      </div>
+      <div class="table-wrap"><table id="deletionsTable"></table></div>
+    </div>
+
+    <div id="panel-support" class="card" hidden>
+      <h2>Support chat</h2>
+      <p class="muted">Messages that passengers and drivers send from Help &amp; support in the app. Replies appear in their app; they check for new replies every few seconds while the chat is open.</p>
+      <p id="supportNote" class="error" role="alert"></p>
+      <div class="support">
+        <div id="threadList"></div>
+        <div>
+          <div id="convHead" class="convhead"></div>
+          <div id="bubbles" class="bubbles"></div>
+          <div class="replybox">
+            <textarea id="replyText" rows="2" maxlength="500" placeholder="Write a reply (500 characters max)"></textarea>
+            <button id="btnReply">Send</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <div id="panel-activity" class="card" hidden>
       <h2>Administrator activity log</h2>
       <p class="muted">A record of what was verified, edited, deleted or cancelled from this page.</p>
@@ -231,12 +283,16 @@
   const $ = (id) => document.getElementById(id);
   let adminKey = sessionStorage.getItem('adminKey') || '';
   let drivers = [], passengers = [], bookings = [], reports = [], announcements = [], logs = [], stats = null;
+  let deletions = [], threads = [], threadMessages = [];
+  let selectedThread = null;
+  let seenCounts = null;            // pending deletions and unread messages at the last refresh
   let timer = null;
   let currentTab = 'dashboard';
 
   const TABS = [
     ['dashboard', 'Dashboard'], ['drivers', 'Drivers'], ['passengers', 'Passengers'],
-    ['bookings', 'Bookings'], ['reports', 'Reports'], ['announcements', 'Announcements'], ['activity', 'Activity']
+    ['bookings', 'Bookings'], ['reports', 'Reports'], ['deletions', 'Deletion requests'],
+    ['support', 'Support chat'], ['announcements', 'Announcements'], ['activity', 'Activity']
   ];
 
   // Builds elements with textContent only, so database text can never inject HTML
@@ -304,12 +360,21 @@
     if (!timer) timer = setInterval(loadAll, 15000);
   }
 
+  // The two newest features need supabase_batch5.sql. If it has not been run yet, the rest of the page still works.
+  async function optional(path) {
+    try { return await api(path); }
+    catch (e) { if (e.auth) throw e; return { failed: e.message }; }
+  }
+
   async function loadAll() {
     try {
-      const [d, b, r, p, a, l, s] = await Promise.all([
+      // Opening a conversation marks it as read, so it is loaded first and the counts come out right
+      if (currentTab === 'support' && selectedThread) await loadThread(true);
+
+      const [d, b, r, p, a, l, s, del, sup] = await Promise.all([
         api('/admin/api/drivers'), api('/admin/api/bookings'), api('/admin/api/reports'),
         api('/admin/api/passengers'), api('/admin/api/announcements'), api('/admin/api/logs'),
-        api('/admin/api/stats')
+        api('/admin/api/stats'), optional('/admin/api/deletion-requests'), optional('/admin/api/support/threads')
       ]);
       drivers = d.drivers || [];
       bookings = b.bookings || [];
@@ -318,8 +383,13 @@
       announcements = a.announcements || [];
       logs = l.logs || [];
       stats = s;
+      deletions = del.requests || [];
+      threads = sup.threads || [];
+      $('deletionsNote').textContent = del.failed ? 'Could not load the requests: ' + del.failed : '';
+      $('supportNote').textContent = sup.failed ? 'Could not load the messages: ' + sup.failed : '';
       showApp();
       renderAll();
+      announceNew();
       $('updated').textContent = 'Updated ' + new Date().toLocaleTimeString();
     } catch (e) {
       if (e.auth) {
@@ -333,8 +403,23 @@
   }
 
   function renderAll() {
-    renderStats(); renderDashboard(); renderDrivers(); renderPassengers();
-    renderBookings(); renderReports(); renderAnnouncements(); renderActivity();
+    renderStats(); renderTabs(); renderDashboard(); renderDrivers(); renderPassengers();
+    renderBookings(); renderReports(); renderDeletions(); renderSupport(); renderAnnouncements(); renderActivity();
+  }
+
+  const pendingDeletions = () => deletions.filter((x) => x.status === 'PENDING').length;
+  const unreadMessages = () => threads.reduce((sum, t) => sum + (t.unread || 0), 0);
+
+  // A notice for the administrator: a message pops up when something new arrives, and the tab title shows the total
+  function announceNew() {
+    const now = { del: pendingDeletions(), msg: unreadMessages() };
+    if (seenCounts) {
+      if (now.del > seenCounts.del) toast('New account deletion request');
+      else if (now.msg > seenCounts.msg) toast('New message in Support chat');
+    }
+    seenCounts = now;
+    const total = now.del + now.msg;
+    document.title = (total ? '(' + total + ') ' : '') + 'Isabel-Xpress Admin';
   }
 
   const fmtDate = (iso) => iso ? new Date(iso).toLocaleString() : '-';
@@ -376,7 +461,10 @@
     const inputs = {};
     const err = h('p', { class: 'error', role: 'alert' });
     const body = fields.map((f) => {
-      const input = h('input', { type: f.type || 'text', value: f.value || '', id: 'f_' + f.key });
+      const input = f.type === 'textarea'
+        ? h('textarea', { rows: '3', maxlength: String(f.max || 300), id: 'f_' + f.key })
+        : h('input', { type: f.type || 'text', id: 'f_' + f.key });
+      input.value = f.value || '';
       inputs[f.key] = input;
       return [h('label', { for: 'f_' + f.key }, f.label), input];
     });
@@ -393,7 +481,7 @@
       h('h2', null, title), body, err,
       h('div', { class: 'row' }, h('button', { class: 'neutral', onclick: close }, 'Cancel'), save)));
     document.body.append(overlay);
-    overlay.querySelector('input').focus();
+    overlay.querySelector('input, textarea').focus();
   }
 
   // ---------------------------------------------------------------- stats strip + dashboard
@@ -408,7 +496,9 @@
       ['Pending bookings', count((x) => x.status === 'PENDING', bookings)],
       ['Trips in progress', count((x) => x.status === 'ACCEPTED', bookings)],
       ['Completed trips', count((x) => x.status === 'COMPLETED', bookings)],
-      ['Open reports', count((x) => x.status === 'OPEN', reports)]
+      ['Open reports', count((x) => x.status === 'OPEN', reports)],
+      ['Deletion requests', pendingDeletions()],
+      ['Unread messages', unreadMessages()]
     ];
     $('stats').replaceChildren(...items.map(([label, n]) =>
       h('div', { class: 'stat' }, h('div', { class: 'n' }, String(n)), h('div', { class: 'l' }, label))));
@@ -681,6 +771,136 @@
     $('announcementsTable').replaceChildren(head, rows.length ? h('tbody', null, rows) : emptyRow(3, 'No announcements yet.'));
   }
 
+  // ---------------------------------------------------------------- deletion requests
+  const roleLabel = (r) => (r === 'driver' ? 'Driver' : 'Passenger');
+
+  function deletionBadge(status) {
+    const map = {
+      PENDING: ['Waiting', 'b-warn'], APPROVED: ['Deleted', 'b-gray'],
+      REJECTED: ['Declined', 'b-info'], CANCELLED: ['Cancelled by user', 'b-gray']
+    };
+    const m = map[status] || [status || '-', 'b-gray'];
+    return badge(m[0], m[1]);
+  }
+
+  async function decideDeletion(r, approve) {
+    if (approve) {
+      const msg = 'Approve and erase the account of ' + (r.user_name || 'this person') + '?\n\n' +
+        'Their name, email, mobile number' + (r.role === 'driver' ? ', photo, plate number' : '') +
+        ' and login are erased now and cannot be brought back. Trip records stay without the name.';
+      if (!confirm(msg)) return;
+      try {
+        const d = await send('POST', '/admin/api/deletion-requests/' + encodeURIComponent(r.id) + '/decide', { approve: true });
+        toast(d.message); loadAll();
+      } catch (e) { toast(e.message); }
+      return;
+    }
+    openForm('Decline the request of ' + (r.user_name || 'this person'), [
+      { key: 'note', label: 'Reason (the person will read this in the app and in an email)', type: 'textarea', max: 300 }
+    ], async (v) => {
+      const d = await send('POST', '/admin/api/deletion-requests/' + encodeURIComponent(r.id) + '/decide', { approve: false, note: v.note });
+      toast(d.message); loadAll();
+    });
+  }
+
+  const deletionRows = () => {
+    const f = $('deletionFilter').value;
+    return deletions.filter((r) => (f === 'ALL' || r.status === f) &&
+      contains([r.user_name, r.user_email, r.user_phone, r.reason, r.role], val('search-deletions')));
+  };
+
+  function renderDeletions() {
+    const head = h('thead', null, h('tr', null,
+      ['Person', 'Requested', 'Email', 'Mobile', 'Reason', 'Records', 'Status', ''].map((t) => h('th', null, t))));
+
+    const rows = deletionRows().map((r) => h('tr', null,
+      h('td', null, (r.user_name || '-') + ' ', badge(roleLabel(r.role), 'b-info')),
+      h('td', null, fmtDate(r.created_at)),
+      h('td', null, r.user_email || '-'),
+      h('td', null, r.user_phone || '-'),
+      h('td', { style: 'white-space:normal;min-width:150px' }, r.reason || '-'),
+      h('td', { style: 'white-space:normal;min-width:110px' }, r.status === 'PENDING'
+        ? [r.trips + (r.trips === 1 ? ' trip' : ' trips'),
+           r.role === 'driver' ? ' • ' + r.open_reports + ' open report' + (r.open_reports === 1 ? '' : 's') : null,
+           r.has_active_trip ? [' ', badge('Active trip', 'b-warn')] : null]
+        : '-'),
+      h('td', { style: 'white-space:normal;min-width:140px' }, deletionBadge(r.status),
+        r.admin_note ? h('div', { class: 'muted small' }, r.admin_note) : null,
+        r.decided_at ? h('div', { class: 'muted small' }, fmtDate(r.decided_at)) : null),
+      h('td', null, r.status === 'PENDING'
+        ? h('div', { class: 'actions' },
+            h('button', { class: 'small danger', onclick: () => decideDeletion(r, true) }, 'Approve'),
+            h('button', { class: 'small neutral', onclick: () => decideDeletion(r, false) }, 'Decline'))
+        : null)));
+
+    $('deletionsTable').replaceChildren(head, rows.length ? h('tbody', null, rows) : emptyRow(8, 'Nothing here.'));
+  }
+
+  // ---------------------------------------------------------------- support chat
+  async function loadThread(quiet) {
+    if (!selectedThread) return;
+    try {
+      threadMessages = (await api('/admin/api/support/thread/' + encodeURIComponent(selectedThread))).messages || [];
+    } catch (e) {
+      if (e.auth) throw e;
+      if (!quiet) toast(e.message);
+      return;
+    }
+    renderConversation(false);
+  }
+
+  async function openThread(userId) {
+    selectedThread = userId;
+    threadMessages = [];
+    renderSupport();
+    await loadThread(false);
+    renderConversation(true);
+    loadAll();
+  }
+
+  function renderSupport() {
+    const list = threads.length
+      ? threads.map((t) => h('button', { class: 'thread' + (t.user_id === selectedThread ? ' active' : ''), onclick: () => openThread(t.user_id) },
+          h('div', { class: 'top' }, h('strong', null, t.user_name || 'User'), badge(roleLabel(t.role), 'b-info'),
+            t.unread ? badge(t.unread + ' new', 'b-warn') : null),
+          h('div', { class: 'last' }, (t.last_sender === 'ADMIN' ? 'You: ' : '') + t.last_message),
+          h('div', { class: 'muted small' }, fmtDate(t.last_at))))
+      : [h('p', { class: 'empty' }, 'No messages yet.')];
+    $('threadList').replaceChildren(...list);
+    renderConversation(false);
+  }
+
+  // Only the header and the bubbles are redrawn, so a reply that is being typed is never lost
+  function renderConversation(scrollDown) {
+    const t = threads.find((x) => x.user_id === selectedThread);
+    const headKids = selectedThread
+      ? [h('strong', null, t ? (t.user_name || 'User') : 'Conversation'), ' ', t ? badge(roleLabel(t.role), 'b-info') : null]
+      : ['Select a conversation on the left.'];
+    $('convHead').replaceChildren(...headKids.filter(Boolean));
+    $('btnReply').disabled = !selectedThread;
+    $('replyText').disabled = !selectedThread;
+
+    const box = $('bubbles');
+    const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+    box.replaceChildren(...threadMessages.map((m) => h('div', { class: 'bubble ' + (m.sender === 'ADMIN' ? 'me' : 'them') },
+      h('div', null, m.message), h('div', { class: 'when' }, fmtDate(m.created_at)))));
+    if (scrollDown || atBottom) box.scrollTop = box.scrollHeight;
+  }
+
+  async function sendReply() {
+    const message = $('replyText').value.trim();
+    if (!selectedThread || !message) { toast('Type a reply first.'); return; }
+    $('btnReply').disabled = true;
+    try {
+      await send('POST', '/admin/api/support/thread/' + encodeURIComponent(selectedThread) + '/reply', { message });
+      $('replyText').value = '';
+      await loadThread(false);
+      renderConversation(true);
+      loadAll();
+    } catch (e) { toast(e.message); }
+    $('btnReply').disabled = false;
+  }
+
   // ---------------------------------------------------------------- activity
   const logRows = () => logs.filter((l) => contains([l.action, l.detail], val('search-activity')));
 
@@ -693,11 +913,22 @@
   }
 
   // ---------------------------------------------------------------- tabs and wiring
+  // The tab buttons show how many requests or messages are waiting
+  function tabLabel(id, label) {
+    const n = id === 'deletions' ? pendingDeletions() : id === 'support' ? unreadMessages() : 0;
+    return n ? label + ' (' + n + ')' : label;
+  }
+
+  function renderTabs() {
+    $('tabs').replaceChildren(...TABS.map(([id, label]) =>
+      h('button', { class: 'tab' + (id === currentTab ? ' active' : ''), onclick: () => selectTab(id) }, tabLabel(id, label))));
+  }
+
   function selectTab(name) {
     currentTab = name;
     for (const [id] of TABS) $('panel-' + id).hidden = id !== name;
-    $('tabs').replaceChildren(...TABS.map(([id, label]) =>
-      h('button', { class: 'tab' + (id === name ? ' active' : ''), onclick: () => selectTab(id) }, label)));
+    renderTabs();
+    if (name === 'support' && selectedThread && !$('appView').hidden) loadAll();
   }
 
   function signIn() {
@@ -725,6 +956,12 @@
   $('search-reports').addEventListener('input', renderReports);
   $('search-activity').addEventListener('input', renderActivity);
   $('statusFilter').addEventListener('change', renderBookings);
+  $('search-deletions').addEventListener('input', renderDeletions);
+  $('deletionFilter').addEventListener('change', renderDeletions);
+  $('btnReply').addEventListener('click', sendReply);
+  $('replyText').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendReply(); }
+  });
 
   $('csv-drivers').addEventListener('click', () => downloadCsv('drivers', [
     ['Name', (d) => d.full_name], ['Email', (d) => d.email], ['Mobile', (d) => d.phone], ['Body number', (d) => d.toda_body_number],
