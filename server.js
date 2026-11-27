@@ -179,6 +179,26 @@ setInterval(() => {
     for (const [k, v] of hits) if (v.reset < now) hits.delete(k);
 }, 10 * 60 * 1000).unref();
 
+// The same limit, counted for each signed-in account (use it after requireAuth). People who share one Wi-Fi
+// or one mobile-data address then do not use up each other's limit.
+function rateLimitUser(name, max, windowMs) {
+    return (req, res, next) => {
+        const key = `${name}:user:${req.auth ? req.auth.sub : req.ip}`;
+        const now = Date.now();
+        const rec = hits.get(key);
+
+        if (!rec || rec.reset < now) {
+            hits.set(key, { count: 1, reset: now + windowMs });
+            return next();
+        }
+        rec.count += 1;
+        if (rec.count > max) {
+            return res.status(429).json({ success: false, message: 'Too many messages. Please wait a moment and try again.' });
+        }
+        next();
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Admin protection
 // ---------------------------------------------------------------------------
@@ -1127,6 +1147,104 @@ app.post('/bookings/:id/rate', requireAuth('passenger'), async (req, res) => {
         res.status(500).json({ success: false, message: 'Server error.' });
     }
 });
+
+// ---------------------------------------------------------------------------
+// Chat between the passenger and the driver of an accepted booking.
+// The messages stay in the server's memory (the last 200 of each booking) while the trip is active and are NOT saved
+// in the database. The app sends with POST, and gets new messages by a push over the socket and by asking again every
+// few seconds, so a message is not lost when one phone reconnects. The chat closes when the trip is completed or cancelled.
+// ---------------------------------------------------------------------------
+const TRIP_CHAT_MAX = 200;
+const tripChats = new Map();          // booking id -> { messages: [...], touched: milliseconds }
+
+function tripChatMessages(bookingId) {
+    let chat = tripChats.get(bookingId);
+    if (!chat) {
+        chat = { messages: [], touched: Date.now() };
+        tripChats.set(bookingId, chat);
+    }
+    chat.touched = Date.now();
+    return chat.messages;
+}
+
+// The booking, if this person is its passenger or its driver and the trip is still accepted
+async function openTripChat(auth, bookingId) {
+    if (!isUuid(bookingId)) return { error: 'Booking not found.', status: 404 };
+
+    const { data: b, error } = await supabase
+        .from('bookings').select('id, passenger_id, driver_id, status').eq('id', bookingId).maybeSingle();
+    if (error) return { error: 'Could not open the chat.', status: 400 };
+    if (!b || !isParticipant(auth, b)) return { error: 'Booking not found.', status: 404 };
+
+    if (b.status !== 'ACCEPTED') {
+        tripChats.delete(b.id);
+        return { error: 'This chat is closed because the trip is no longer active.', status: 409, closed: true };
+    }
+    return { booking: b };
+}
+
+// Keeps the message and pushes it to the passenger and the driver of the booking
+function addTripMessage(auth, booking, text, exceptSocketId) {
+    const msg = {
+        id: crypto.randomUUID(),
+        role: auth.role,
+        sender: `${cleanText(auth.name, 60) || 'User'} (${auth.role === 'driver' ? 'Driver' : 'Passenger'})`,
+        message: text,
+        created_at: new Date().toISOString()
+    };
+
+    const list = tripChatMessages(booking.id);
+    list.push(msg);
+    if (list.length > TRIP_CHAT_MAX) list.shift();
+
+    // The booking room, plus each person's own connection, in case one of them missed the join after reconnecting.
+    // One push reaches a phone once, even if it is in several of these rooms.
+    let target = io.to(`booking:${booking.id}`).to(`passenger:${booking.passenger_id}`);
+    const driverSocketId = booking.driver_id && driverSockets.get(booking.driver_id);
+    if (driverSocketId) target = target.to(driverSocketId);
+    if (exceptSocketId) target = target.except(exceptSocketId);
+    target.emit('chat_message', { bookingId: booking.id, ...msg });
+    return msg;
+}
+
+app.get('/bookings/:id/chat', requireAuth(), rateLimitUser('tripchatget', 600, 10 * 60 * 1000), async (req, res) => {
+    try {
+        const open = await openTripChat(req.auth, req.params.id);
+        if (open.error) return res.status(open.status).json({ success: false, closed: !!open.closed, message: open.error });
+
+        const list = tripChatMessages(open.booking.id);
+        const after = typeof req.query.after === 'string' ? req.query.after : '';
+        const index = after ? list.findIndex((m) => m.id === after) : -1;
+        res.status(200).json({ success: true, messages: index >= 0 ? list.slice(index + 1) : list });
+    } catch (err) {
+        console.error('TRIP CHAT LOAD ERROR:', err);
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
+app.post('/bookings/:id/chat', requireAuth(), rateLimitUser('tripchat', 100, 10 * 60 * 1000), async (req, res) => {
+    try {
+        const text = cleanText(req.body.message, 500);
+        if (!text) return res.status(400).json({ success: false, message: 'Type a message first.' });
+
+        const open = await openTripChat(req.auth, req.params.id);
+        if (open.error) return res.status(open.status).json({ success: false, closed: !!open.closed, message: open.error });
+
+        const item = addTripMessage(req.auth, open.booking, text);
+        res.status(200).json({ success: true, message: 'Sent', item });
+    } catch (err) {
+        console.error('TRIP CHAT SEND ERROR:', err);
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
+// Forget the chats of trips that were never read again (memory only)
+setInterval(() => {
+    const cutoff = Date.now() - 3 * 60 * 60 * 1000;
+    for (const [bookingId, chat] of tripChats) {
+        if (chat.touched < cutoff) tripChats.delete(bookingId);
+    }
+}, 10 * 60 * 1000).unref();
 
 // Passenger reports a driver; the administrator reviews it
 const REPORT_REASONS = [
@@ -2619,16 +2737,29 @@ io.on('connection', (socket) => {
         }
     });
 
-    socket.on('chat_message', (d) => {
-        if (!d || !d.bookingId || !socket.data.bookingRooms.has(d.bookingId)) return;
-        const message = String(d.message || '').trim().slice(0, 500);
-        if (!message) return;
+    // Older app versions still send chat over the socket; it goes through the same checks and the same history
+    socket.on('chat_message', async (d, ack) => {
+        const reply = (o) => { if (typeof ack === 'function') ack(o); };
+        try {
+            if (!d || !d.bookingId) return reply({ ok: false, message: 'No booking.' });
+            const text = cleanText(d.message, 500);
+            if (!text) return reply({ ok: false, message: 'Type a message first.' });
 
-        socket.to(`booking:${d.bookingId}`).emit('chat_message', {
-            bookingId: d.bookingId,
-            sender: `${auth.name || 'User'} (${auth.role === 'driver' ? 'Driver' : 'Passenger'})`,
-            message
-        });
+            // At most 30 messages a minute from one connection
+            const now = Date.now();
+            socket.data.chatTimes = (socket.data.chatTimes || []).filter((t) => now - t < 60 * 1000);
+            if (socket.data.chatTimes.length >= 30) return reply({ ok: false, message: 'Please slow down a little.' });
+            socket.data.chatTimes.push(now);
+
+            const open = await openTripChat(auth, String(d.bookingId));
+            if (open.error) return reply({ ok: false, message: open.error });
+
+            addTripMessage(auth, open.booking, text, socket.id);
+            reply({ ok: true });
+        } catch (err) {
+            console.error('SOCKET CHAT ERROR:', err);
+            reply({ ok: false, message: 'Could not send.' });
+        }
     });
 
     socket.on('driver_online', async () => {
