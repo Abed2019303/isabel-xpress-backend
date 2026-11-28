@@ -476,9 +476,12 @@ app.post('/login', rateLimit('login', 20, 15 * 60 * 1000), async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// Driver requirements. Before a driver can go online or accept a booking, the profile must be complete:
+// Driver requirements. Before a driver can accept a booking, the profile must be complete:
 // own photo, vehicle photo, LGU license photo, LGU license number, owner or renting, kind of vehicle,
 // vehicle color, plate number and home address. The administrator can reject a picture; it then counts as missing again.
+// A driver whose profile is not complete can still log in, go online and look at the waiting bookings, but is not
+// shown to passengers, and the Accept button answers "Complete your profile before accepting a booking".
+// The profile has a percentage, like a wallet app: the account is the first 10%, each of the nine items adds 10%.
 // ---------------------------------------------------------------------------
 const VEHICLE_TYPES = ['E-Racal', 'Tricycle', 'Pedicab', 'Motorcycle', 'Van', 'Car', 'Other'];
 const OWNERSHIP_TYPES = ['OWNER', 'RENTING'];
@@ -563,7 +566,10 @@ function driverRequirements(d, docs) {
         text('address', 'Home address', has(d.address))
     ];
     const missing = items.filter((i) => !i.ok).map((i) => i.label);
-    return { complete: missing.length === 0, items, missing };
+    // The account itself (registered, email checked, TODA body number checked by the administrator) is the first 10%.
+    // Each of the nine items adds 10%, so a profile with everything in is 100%: fully verified.
+    const percent = Math.round(((1 + items.length - missing.length) / (1 + items.length)) * 100);
+    return { complete: missing.length === 0, percent, items, missing };
 }
 
 const REQUIREMENT_COLUMNS = 'id, photo_status, plate_number, vehicle_ownership, vehicle_type, vehicle_color, address, lgu_license_no';
@@ -583,13 +589,13 @@ async function loadRequirements(driverId) {
 const incompleteReply = (need) => ({
     success: false,
     code: 'PROFILE_INCOMPLETE',
+    percent: need.percent,
     missing: need.missing,
-    message: 'Complete your profile before you accept bookings. Still needed: ' + need.missing.join(', ') + '.'
+    message: 'Complete your profile before accepting a booking. Your profile is ' + need.percent + '% complete. Still needed: ' + need.missing.join(', ') + '.'
 });
 
-// Sends the refusal and returns false when this driver may not work yet (profile not complete).
-// beforeRefusing runs before the answer is sent when the profile is not complete.
-async function driverProfileAllows(driverId, res, beforeRefusing) {
+// Sends the refusal and returns false when this driver may not accept bookings yet (profile not complete).
+async function driverProfileAllows(driverId, res) {
     const need = await loadRequirements(driverId);
     if (need.error) {
         console.error('REQUIREMENTS ERROR:', need.error);
@@ -602,7 +608,6 @@ async function driverProfileAllows(driverId, res, beforeRefusing) {
         return false;
     }
     if (!need.complete) {
-        if (beforeRefusing) await beforeRefusing();
         res.status(403).json(incompleteReply(need));
         return false;
     }
@@ -1041,11 +1046,8 @@ app.post('/driver-status', requireAuth('driver'), async (req, res) => {
             if (!driver.is_verified) {
                 return res.status(403).json({ success: false, message: 'Your account is not verified yet.' });
             }
-            // A driver who is not allowed to work must not stay listed as online
-            const mayWork = await driverProfileAllows(driverId, res, async () => {
-                await supabase.from('drivers').update({ is_online: false }).eq('id', driverId);
-            });
-            if (!mayWork) return;
+            // A driver whose profile is not complete may go online and look at the bookings. Accepting needs the
+            // complete profile, and passengers do not see the driver on the map until then.
         }
 
         const { error } = await supabase.from('drivers').update({ is_online: isOnline }).eq('id', driverId);
@@ -1157,7 +1159,6 @@ app.get('/bookings/available', requireAuth('driver'), async (req, res) => {
         if (!driver || !driver.is_verified) {
             return res.status(403).json({ success: false, message: 'Your account is not verified.' });
         }
-        if (!(await driverProfileAllows(req.auth.sub, res))) return;
 
         const { data, error } = await supabase
             .from('bookings')
@@ -1619,7 +1620,7 @@ app.get('/driver/me', requireAuth('driver'), async (req, res) => {
                 address: own ? own.address : null,
                 lgu_license_no: own ? own.lgu_license_no : null
             },
-            requirements: { complete: need.complete, items: need.items, missing: need.missing }
+            requirements: { complete: need.complete, percent: need.percent, items: need.items, missing: need.missing }
         });
     } catch (err) {
         profileFailure(res, err);
@@ -1675,7 +1676,7 @@ app.get('/driver/overview', requireAuth('driver'), async (req, res) => {
 
         res.status(200).json({
             success: true,
-            requirements: { complete: need.complete, items: need.items, missing: need.missing },
+            requirements: { complete: need.complete, percent: need.percent, items: need.items, missing: need.missing },
             ratings: await ratingSummary(req.auth.sub)
         });
     } catch (err) {
@@ -1778,8 +1779,10 @@ app.post('/driver/profile', requireAuth('driver'), rateLimit('driverprofile', 20
         res.status(200).json({
             success: true,
             message: (newPicture ? 'Saved. Your new picture is waiting for administrator approval.' : 'Saved.') +
-                (need.complete ? ' Your profile is complete. You can accept bookings.' : ''),
+                (need.complete ? ' Your profile is 100% complete. You are fully verified and can accept bookings.'
+                    : ' Your profile is ' + need.percent + '% complete.'),
             complete: need.complete === true,
+            percent: need.percent,
             missing: need.missing || []
         });
     } catch (err) {
@@ -2219,20 +2222,20 @@ const FAQ = [
         id: 'd_register', roles: BOTH, title: 'How do I become a verified driver?',
         strong: ['become a driver', 'become driver', 'register as driver', 'driver registration', 'sign up as driver', 'verified driver', 'get verified', 'body number', 'toda'],
         keywords: ['register', 'sign up', 'apply', 'join', 'verified', 'verification'],
-        answer: 'Register as a driver with your name, email, mobile number, password, TODA body number and home address. Say if you own the vehicle or are renting it, and give its kind (E-Racal, tricycle, motorcycle, van...), color, plate number and your LGU license number. Attach your photo, a photo of the vehicle and a photo of your LGU license. Then type the 6-digit code sent to your email. The administrator checks your details and verifies you. You can log in only after that.'
+        answer: 'Register as a driver with your name, email, mobile number, password and TODA body number. Then type the 6-digit code sent to your email. The administrator checks your TODA body number and verifies you. You can log in only after that. After you log in, complete your profile (Profile & QR) to start accepting bookings. Your profile shows a percentage, and at 100% you are fully verified.'
     },
     {
         id: 'd_requirements', roles: ['driver'], title: 'What do I need before I can accept bookings?',
         strong: ['requirement', 'requirements', 'complete my profile', 'complete profile', 'profile incomplete', 'incomplete', 'lgu', 'license', 'licence', 'permit', 'cannot accept', 'can\'t accept', 'cant accept', 'owner or renting', 'renting'],
         keywords: ['complete', 'profile', 'missing'],
         patterns: [/(complete|finish|fill).*(profile|requirement)/],
-        answer: 'For safety, you must complete your profile before you can go online or accept a booking: your photo, a photo of your vehicle, a photo of your LGU license and its number, if you own the vehicle or are renting it, the kind of vehicle, its color, your plate number and your home address. Open Profile & QR and fill in what is missing. The dashboard shows what is still needed. The administrator checks your pictures, and a rejected picture must be sent again.'
+        answer: 'For safety, you must complete your profile before you can accept a booking. Your profile shows a percentage, like a wallet app. Your account starts at 10%, and each of these nine items adds 10%: your photo, a photo of your vehicle, a photo of your LGU license, your LGU license number, if you own the vehicle or are renting it, the kind of vehicle, its color, your plate number and your home address. At 100% you are fully verified. Until then you can go online and see bookings, but Accept says to complete your profile first, and passengers do not see you on the map. Open Profile & QR and fill in what is missing. The administrator checks your pictures, and a rejected picture must be sent again.'
     },
     {
         id: 'd_online', roles: ['driver'], title: 'How do I get bookings?',
         strong: ['go online', 'online', 'offline', 'not receiving', 'no bookings', 'no booking', 'walang booking', 'accept booking'],
         keywords: ['receive', 'get booking', 'accept', 'request'],
-        answer: 'Switch Online on the dashboard and keep the app open, so your location is shared. New bookings appear on your dashboard, and you tap Accept Booking. You can have one trip at a time, so finish the current trip first. Only verified drivers with a complete profile can go online or accept a booking.'
+        answer: 'Switch Online on the dashboard and keep the app open, so your location is shared. New bookings appear on your dashboard, and you tap Accept Booking. You can have one trip at a time, so finish the current trip first. Only verified drivers can go online, and to accept a booking your profile must be 100% complete.'
     },
     {
         id: 'd_complete', roles: ['driver'], title: 'How do I finish a trip?',
@@ -2426,6 +2429,7 @@ app.get('/admin/api/drivers', requireAdmin, async (req, res) => {
                 vehicle_photo_status: docs ? docs.vehicle_photo_status : 'NONE',
                 license_photo_status: docs ? docs.license_photo_status : 'NONE',
                 requirements_complete: need.complete,
+                requirements_percent: need.percent,
                 requirements_missing: need.missing,
                 avg_rating: sums[d.id] ? parseFloat((sums[d.id].total / sums[d.id].n).toFixed(2)) : null,
                 rating_count: sums[d.id] ? sums[d.id].n : 0,
@@ -3261,7 +3265,7 @@ io.on('connection', (socket) => {
     socket.on('join_drivers', async () => {
         if (auth.role !== 'driver') return;
         const { data: driver } = await supabase.from('drivers').select('is_verified').eq('id', auth.sub).maybeSingle();
-        if (driver && driver.is_verified && (await loadRequirements(auth.sub)).complete) socket.join('drivers');
+        if (driver && driver.is_verified) socket.join('drivers');
     });
 
     socket.on('join_booking', async (d) => {
@@ -3316,7 +3320,6 @@ io.on('connection', (socket) => {
                 .maybeSingle();
 
             if (!driver || !driver.is_verified) return;
-            if (!(await loadRequirements(driver.id)).complete) return;     // the profile must be complete first
 
             socket.data.driverId = driver.id;
             socket.data.driverInfo = { fullName: driver.full_name, bodyNumber: driver.toda_body_number };
@@ -3342,13 +3345,16 @@ io.on('connection', (socket) => {
                 !Number.isFinite(lat) || !Number.isFinite(lng) ||
                 Math.abs(lat) > 90 || Math.abs(lng) > 180) return;
 
-            socket.broadcast.emit('location_changed', {
-                driverId,
-                fullName: info.fullName,
-                bodyNumber: info.bodyNumber,
-                latitude: lat,
-                longitude: lng
-            });
+            // Passengers see a driver on the map only when the profile is complete (the answer is kept for 20 seconds)
+            if ((await completeProfileIds([driverId])).has(String(driverId))) {
+                socket.broadcast.emit('location_changed', {
+                    driverId,
+                    fullName: info.fullName,
+                    bodyNumber: info.bodyNumber,
+                    latitude: lat,
+                    longitude: lng
+                });
+            }
 
             const now = Date.now();
             if (now - (lastLocationWrite.get(driverId) || 0) >= 10000) {
