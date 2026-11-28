@@ -503,6 +503,13 @@ function jpegProblem(value) {
 const jpegMessage = (problem, label) =>
     problem === 'big' ? `The ${label} must be a small JPEG image.` : `That file is not a valid JPEG ${label}.`;
 
+// The app sends the license picture as license_photo. Older notes called it lgu_license_photo, so both names are
+// accepted. (The server once listened only for the second name, so a license picture sent by the app was dropped.)
+function normalizePictureNames(body) {
+    if (body && !body.lgu_license_photo && body.license_photo) body.lgu_license_photo = body.license_photo;
+    return body;
+}
+
 // The typed details of the vehicle and the driver. Only the fields that were sent are read.
 // strict: a field that was sent may not be empty (used at registration, where the app asks for all of them).
 // Returns { update } with the cleaned values, or { error } with a message for the driver.
@@ -672,6 +679,7 @@ app.post('/driver-register', rateLimit('driver-register', 10, 60 * 60 * 1000), a
 
         // Vehicle and address details, and the three pictures (the app asks for all of them; an older app sends none,
         // and then the driver has to complete the profile before accepting bookings)
+        normalizePictureNames(req.body);
         const details = readVehicleDetails(req.body, true);
         if (details.error) return res.status(400).json({ success: false, message: details.error });
 
@@ -1725,6 +1733,7 @@ async function saveDriverDocuments(driverId, docs) {
 
 app.post('/driver/profile', requireAuth('driver'), rateLimit('driverprofile', 20, 60 * 60 * 1000), async (req, res) => {
     try {
+        normalizePictureNames(req.body);
         const typed = readVehicleDetails(req.body, false);
         if (typed.error) return res.status(400).json({ success: false, message: typed.error });
         const update = typed.update;
@@ -1775,9 +1784,14 @@ app.post('/driver/profile', requireAuth('driver'), rateLimit('driverprofile', 20
         forgetRequirements(req.auth.sub);
         const need = await loadRequirements(req.auth.sub);
         const newPicture = !!(update.photo || docs.vehicle_photo || docs.license_photo);
+        const savedPictures = [];
+        if (update.photo) savedPictures.push('photo');
+        if (docs.vehicle_photo) savedPictures.push('vehicle_photo');
+        if (docs.license_photo) savedPictures.push('license_photo');
 
         res.status(200).json({
             success: true,
+            pictures: savedPictures,
             message: (newPicture ? 'Saved. Your new picture is waiting for administrator approval.' : 'Saved.') +
                 (need.complete ? ' Your profile is 100% complete. You are fully verified and can accept bookings.'
                     : ' Your profile is ' + need.percent + '% complete.'),
