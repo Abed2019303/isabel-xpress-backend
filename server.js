@@ -12,8 +12,9 @@ app.set('trust proxy', 1);
 app.disable('x-powered-by');
 app.use(express.urlencoded({ extended: true, limit: '20kb' }));
 const smallJson = express.json({ limit: '20kb' });
-const photoJson = express.json({ limit: '250kb' });   // only the driver photo upload may be larger
-app.use((req, res, next) => (req.path === '/driver/profile' ? photoJson : smallJson)(req, res, next));
+const photoJson = express.json({ limit: '900kb' });   // only the driver's pictures (registration and profile) may be larger
+const PICTURE_PATHS = new Set(['/driver/profile', '/driver-register']);
+app.use((req, res, next) => (PICTURE_PATHS.has(req.path) ? photoJson : smallJson)(req, res, next));
 
 app.use((req, res, next) => {
     res.set('X-Content-Type-Options', 'nosniff');
@@ -474,6 +475,172 @@ app.post('/login', rateLimit('login', 20, 15 * 60 * 1000), async (req, res) => {
     }
 });
 
+// ---------------------------------------------------------------------------
+// Driver requirements. Before a driver can go online or accept a booking, the profile must be complete:
+// own photo, vehicle photo, LGU license photo, LGU license number, owner or renting, kind of vehicle,
+// vehicle color, plate number and home address. The administrator can reject a picture; it then counts as missing again.
+// ---------------------------------------------------------------------------
+const VEHICLE_TYPES = ['E-Racal', 'Tricycle', 'Pedicab', 'Motorcycle', 'Van', 'Car', 'Other'];
+const OWNERSHIP_TYPES = ['OWNER', 'RENTING'];
+const PHOTO_MAX_CHARS = 200000;
+const SCHEMA_MESSAGE = 'The server database needs its latest update (supabase_batch6.sql). Please tell the administrator.';
+
+// A missing column or table means that the SQL update was not run yet
+const isMissingSchema = (error) => !!error && ['42703', '42P01', 'PGRST204', 'PGRST205'].includes(String(error.code));
+
+// null when the text is a real JPEG picture of a small size, otherwise 'big' or 'invalid'
+function jpegProblem(value) {
+    const photo = String(value || '');
+    const m = /^data:image\/jpeg;base64,([A-Za-z0-9+/=]+)$/.exec(photo);
+    if (!m || photo.length > PHOTO_MAX_CHARS) return 'big';
+    const bytes = Buffer.from(m[1], 'base64');
+    if (bytes.length < 1000 || bytes[0] !== 0xff || bytes[1] !== 0xd8) return 'invalid';
+    return null;
+}
+const jpegMessage = (problem, label) =>
+    problem === 'big' ? `The ${label} must be a small JPEG image.` : `That file is not a valid JPEG ${label}.`;
+
+// The typed details of the vehicle and the driver. Only the fields that were sent are read.
+// strict: a field that was sent may not be empty (used at registration, where the app asks for all of them).
+// Returns { update } with the cleaned values, or { error } with a message for the driver.
+function readVehicleDetails(body, strict) {
+    const update = {};
+    const fail = (message) => ({ error: message });
+
+    if (body.vehicle_ownership !== undefined) {
+        const v = String(body.vehicle_ownership || '').trim().toUpperCase();
+        if (!OWNERSHIP_TYPES.includes(v)) return fail('Choose if you own the vehicle or are renting it.');
+        update.vehicle_ownership = v;
+    }
+    if (body.vehicle_type !== undefined) {
+        const wanted = String(body.vehicle_type || '').trim().toLowerCase();
+        const v = VEHICLE_TYPES.find((t) => t.toLowerCase() === wanted);
+        if (!v) return fail('Choose the kind of vehicle you drive.');
+        update.vehicle_type = v;
+    }
+    if (body.vehicle_color !== undefined) {
+        const v = cleanText(body.vehicle_color, 30);
+        if (!v) return fail('Enter the color of your vehicle.');
+        update.vehicle_color = v;
+    }
+    if (body.address !== undefined) {
+        const v = cleanText(body.address, 200);
+        if (v.length < 5) return fail('Enter your complete home address.');
+        update.address = v;
+    }
+    if (body.lgu_license_no !== undefined) {
+        const v = cleanText(body.lgu_license_no, 40).toUpperCase();
+        if (!v) return fail('Enter your LGU license number.');
+        update.lgu_license_no = v;
+    }
+    if (body.plate_number !== undefined) {
+        const v = cleanText(body.plate_number, 12).toUpperCase();
+        if (strict && !v) return fail('Enter the plate number of your vehicle.');
+        update.plate_number = v || null;
+    }
+    return { update };
+}
+
+// The list of requirements and which of them are done. d is the driver row, docs is its row in driver_documents.
+// A picture counts when it was sent and the administrator did not reject it.
+function driverRequirements(d, docs) {
+    const has = (v) => typeof v === 'string' && v.trim().length > 0;
+    const pic = (key, label, status, note) => {
+        const state = status && status !== 'NONE' ? status : 'MISSING';
+        return { key, label, ok: state === 'PENDING' || state === 'APPROVED', state, note: state === 'REJECTED' && note ? note : null };
+    };
+    const text = (key, label, ok) => ({ key, label, ok, state: ok ? 'DONE' : 'MISSING', note: null });
+
+    const items = [
+        pic('photo', 'Your photo', d.photo_status, null),
+        pic('vehicle_photo', 'Photo of your vehicle', docs && docs.vehicle_photo_status, docs && docs.vehicle_photo_note),
+        pic('license_photo', 'LGU license photo', docs && docs.license_photo_status, docs && docs.license_photo_note),
+        text('lgu_license_no', 'LGU license number', has(d.lgu_license_no)),
+        text('vehicle_ownership', 'Owner or renting', OWNERSHIP_TYPES.includes(d.vehicle_ownership)),
+        text('vehicle_type', 'Kind of vehicle', VEHICLE_TYPES.includes(d.vehicle_type)),
+        text('vehicle_color', 'Vehicle color', has(d.vehicle_color)),
+        text('plate_number', 'Plate number', has(d.plate_number)),
+        text('address', 'Home address', has(d.address))
+    ];
+    const missing = items.filter((i) => !i.ok).map((i) => i.label);
+    return { complete: missing.length === 0, items, missing };
+}
+
+const REQUIREMENT_COLUMNS = 'id, photo_status, plate_number, vehicle_ownership, vehicle_type, vehicle_color, address, lgu_license_no';
+const DOCUMENT_STATUS_COLUMNS = 'vehicle_photo_status, vehicle_photo_note, license_photo_status, license_photo_note';
+
+// One driver's requirements, from the database. Returns { complete, items, missing } or { error } or { notFound }.
+async function loadRequirements(driverId) {
+    const { data: d, error } = await supabase.from('drivers').select(REQUIREMENT_COLUMNS).eq('id', driverId).maybeSingle();
+    if (error) return { error };
+    if (!d) return { notFound: true };
+    const { data: docs, error: docsError } = await supabase
+        .from('driver_documents').select(DOCUMENT_STATUS_COLUMNS).eq('driver_id', driverId).maybeSingle();
+    if (docsError) return { error: docsError };
+    return driverRequirements(d, docs);
+}
+
+const incompleteReply = (need) => ({
+    success: false,
+    code: 'PROFILE_INCOMPLETE',
+    missing: need.missing,
+    message: 'Complete your profile before you accept bookings. Still needed: ' + need.missing.join(', ') + '.'
+});
+
+// Sends the refusal and returns false when this driver may not work yet (profile not complete).
+// beforeRefusing runs before the answer is sent when the profile is not complete.
+async function driverProfileAllows(driverId, res, beforeRefusing) {
+    const need = await loadRequirements(driverId);
+    if (need.error) {
+        console.error('REQUIREMENTS ERROR:', need.error);
+        const schema = isMissingSchema(need.error);
+        res.status(schema ? 503 : 500).json({ success: false, message: schema ? SCHEMA_MESSAGE : 'Server error.' });
+        return false;
+    }
+    if (need.notFound) {
+        res.status(404).json({ success: false, message: 'Driver not found.' });
+        return false;
+    }
+    if (!need.complete) {
+        if (beforeRefusing) await beforeRefusing();
+        res.status(403).json(incompleteReply(need));
+        return false;
+    }
+    return true;
+}
+
+// Which of these drivers have a complete profile. The answer is kept for 20 seconds, so the passengers' map does not
+// ask the database every time. When the database cannot answer, nobody counts as complete (and nothing is kept).
+const completeCache = new Map();      // driver id -> { ok, until }
+const forgetRequirements = (driverId) => completeCache.delete(String(driverId));
+
+async function completeProfileIds(ids) {
+    const now = Date.now();
+    const result = new Set();
+    const ask = [];
+    for (const id of ids) {
+        const kept = completeCache.get(id);
+        if (kept && kept.until > now) { if (kept.ok) result.add(id); }
+        else ask.push(id);
+    }
+    if (ask.length === 0) return result;
+
+    const { data: rows, error } = await supabase.from('drivers').select(REQUIREMENT_COLUMNS).in('id', ask);
+    const { data: docs, error: docsError } = await supabase
+        .from('driver_documents').select('driver_id, ' + DOCUMENT_STATUS_COLUMNS).in('driver_id', ask);
+    if (error || docsError) {
+        console.error('COMPLETE PROFILES ERROR:', error || docsError);
+        return result;
+    }
+    const docMap = Object.fromEntries((docs || []).map((x) => [x.driver_id, x]));
+    for (const row of rows || []) {
+        const ok = driverRequirements(row, docMap[row.id]).complete;
+        completeCache.set(row.id, { ok, until: now + 20 * 1000 });
+        if (ok) result.add(row.id);
+    }
+    return result;
+}
+
 app.post('/driver-register', rateLimit('driver-register', 10, 60 * 60 * 1000), async (req, res) => {
     try {
         const { full_name, fullName, password, toda_body_number, bodyNumber } = req.body;
@@ -498,23 +665,60 @@ app.post('/driver-register', rateLimit('driver-register', 10, 60 * 60 * 1000), a
             return res.status(400).json({ success: false, message: PASSWORD_MESSAGE });
         }
 
-        const { data, error } = await supabase
-            .from('drivers')
-            .insert([{
-                full_name: nameToSave,
-                email,
-                phone,
-                password: await hashPassword(password),
-                toda_body_number: bodyToSave,
-                is_online: false,
-                is_verified: false,
-                email_verified: false
-            }])
-            .select();
+        // Vehicle and address details, and the three pictures (the app asks for all of them; an older app sends none,
+        // and then the driver has to complete the profile before accepting bookings)
+        const details = readVehicleDetails(req.body, true);
+        if (details.error) return res.status(400).json({ success: false, message: details.error });
+
+        const pictures = {};
+        for (const [field, label] of [['photo', 'photo'], ['vehicle_photo', 'vehicle photo'], ['lgu_license_photo', 'license photo']]) {
+            if (req.body[field]) {
+                const problem = jpegProblem(req.body[field]);
+                if (problem) return res.status(400).json({ success: false, message: jpegMessage(problem, label) });
+                pictures[field] = String(req.body[field]);
+            }
+        }
+
+        const row = {
+            full_name: nameToSave,
+            email,
+            phone,
+            password: await hashPassword(password),
+            toda_body_number: bodyToSave,
+            is_online: false,
+            is_verified: false,
+            email_verified: false,
+            ...details.update
+        };
+        if (pictures.photo) {
+            row.photo = pictures.photo;
+            row.photo_status = 'PENDING';
+        }
+
+        const { data, error } = await supabase.from('drivers').insert([row]).select();
 
         if (error) {
             console.error('DRIVER INSERT ERROR:', error);
+            if (isMissingSchema(error)) return res.status(503).json({ success: false, message: SCHEMA_MESSAGE });
             return res.status(400).json({ success: false, message: 'Could not register. This email may already be in use.' });
+        }
+
+        if (pictures.vehicle_photo || pictures.lgu_license_photo) {
+            const docs = { driver_id: data[0].id, updated_at: new Date().toISOString() };
+            if (pictures.vehicle_photo) { docs.vehicle_photo = pictures.vehicle_photo; docs.vehicle_photo_status = 'PENDING'; }
+            if (pictures.lgu_license_photo) { docs.license_photo = pictures.lgu_license_photo; docs.license_photo_status = 'PENDING'; }
+
+            const { error: docsError } = await supabase.from('driver_documents').insert([docs]);
+            if (docsError) {
+                // Do not leave a half-registered driver behind
+                console.error('DRIVER DOCUMENTS INSERT ERROR:', docsError);
+                await supabase.from('drivers').delete().eq('id', data[0].id);
+                const schema = isMissingSchema(docsError);
+                return res.status(schema ? 503 : 400).json({
+                    success: false,
+                    message: schema ? SCHEMA_MESSAGE : 'Could not save your pictures. Please try again.'
+                });
+            }
         }
 
         const code = await issueCode(email, 'driver', 'verify');
@@ -526,7 +730,7 @@ app.post('/driver-register', rateLimit('driver-register', 10, 60 * 60 * 1000), a
                 ? 'Registered! We sent a 6-digit code to your email. '
                 : 'Registered, but the code email could not be sent. Tap "Resend code" on the next screen. ') +
                 'You can log in after you verify your email and the administrator verifies your TODA details.',
-            user: stripPassword(data[0])
+            user: (({ photo, ...rest }) => rest)(stripPassword(data[0]))
         });
     } catch (err) {
         console.error('DRIVER REGISTER ERROR:', err);
@@ -573,7 +777,10 @@ app.post('/driver-login', rateLimit('driver-login', 20, 15 * 60 * 1000), async (
         }
 
         const token = signToken({ sub: data.id, role: 'driver', name: data.full_name });
-        res.status(200).json({ success: true, message: 'Login successful', token, user: stripPassword(data) });
+        res.status(200).json({
+            success: true, message: 'Login successful', token,
+            user: (({ photo, ...rest }) => rest)(stripPassword(data))
+        });
     } catch (err) {
         console.error('DRIVER LOGIN CRASH:', err);
         res.status(500).json({ success: false, message: 'Server error.' });
@@ -834,6 +1041,11 @@ app.post('/driver-status', requireAuth('driver'), async (req, res) => {
             if (!driver.is_verified) {
                 return res.status(403).json({ success: false, message: 'Your account is not verified yet.' });
             }
+            // A driver who is not allowed to work must not stay listed as online
+            const mayWork = await driverProfileAllows(driverId, res, async () => {
+                await supabase.from('drivers').update({ is_online: false }).eq('id', driverId);
+            });
+            if (!mayWork) return;
         }
 
         const { error } = await supabase.from('drivers').update({ is_online: isOnline }).eq('id', driverId);
@@ -855,7 +1067,8 @@ app.get('/available-drivers', requireAuth(), async (req, res) => {
         if (error) return res.status(400).json({ success: false, message: error.message });
 
         const now = Date.now();
-        const drivers = (data || []).map((d) => ({
+        const allowed = await completeProfileIds((data || []).map((d) => d.id));
+        const drivers = (data || []).filter((d) => allowed.has(d.id)).map((d) => ({
             ...d,
             location_age_seconds: d.location_updated_at
                 ? Math.round((now - new Date(d.location_updated_at).getTime()) / 1000)
@@ -944,6 +1157,7 @@ app.get('/bookings/available', requireAuth('driver'), async (req, res) => {
         if (!driver || !driver.is_verified) {
             return res.status(403).json({ success: false, message: 'Your account is not verified.' });
         }
+        if (!(await driverProfileAllows(req.auth.sub, res))) return;
 
         const { data, error } = await supabase
             .from('bookings')
@@ -1029,6 +1243,7 @@ app.post('/bookings/:id/accept', requireAuth('driver'), async (req, res) => {
         if (!driver.is_verified) {
             return res.status(403).json({ success: false, message: 'Your account is not verified yet.' });
         }
+        if (!(await driverProfileAllows(driverId, res))) return;
 
         const { data: busy } = await supabase
             .from('bookings').select('id').eq('driver_id', driverId).eq('status', 'ACCEPTED').limit(1);
@@ -1128,9 +1343,12 @@ app.post('/bookings/:id/rate', requireAuth('passenger'), async (req, res) => {
             return res.status(400).json({ success: false, message: 'Rating must be from 1 to 5.' });
         }
 
+        // Satisfied or not satisfied. An older app does not send it, so 4 or 5 stars count as satisfied.
+        const satisfied = typeof req.body.satisfied === 'boolean' ? req.body.satisfied : rating >= 4;
+
         const { data, error } = await supabase
             .from('bookings')
-            .update({ rating, rating_comment: comment || null, rated_at: new Date().toISOString() })
+            .update({ rating, rating_comment: comment || null, rating_satisfied: satisfied, rated_at: new Date().toISOString() })
             .eq('id', req.params.id)
             .eq('passenger_id', req.auth.sub)
             .eq('status', 'COMPLETED')
@@ -1140,6 +1358,14 @@ app.post('/bookings/:id/rate', requireAuth('passenger'), async (req, res) => {
         if (error) return res.status(400).json({ success: false, message: 'Could not save the rating.' });
         if (!data || data.length === 0) {
             return res.status(409).json({ success: false, message: 'This trip cannot be rated (already rated or not completed).' });
+        }
+
+        // The driver sees the rating right away if the app is open (the passenger's name is not sent)
+        const driverSocketId = data[0].driver_id && driverSockets.get(data[0].driver_id);
+        if (driverSocketId) {
+            io.to(driverSocketId).emit('rating_received', {
+                bookingId: data[0].id, rating, satisfied, comment: comment || null
+            });
         }
 
         res.status(200).json({ success: true, message: 'Thank you for your feedback!' });
@@ -1246,41 +1472,56 @@ setInterval(() => {
     }
 }, 10 * 60 * 1000).unref();
 
-// Passenger reports a driver; the administrator reviews it
+// A passenger can report the driver of a trip, and a driver can report the passenger of a trip.
+// Only the administrator ever sees a report. The person who is reported is never told, and no route gives reports to
+// passengers or drivers, so nobody can be targeted for reporting someone.
 const REPORT_REASONS = [
     'Overcharged / wrong fare',
     'Rude or unsafe driving',
     'Driver did not match registered details',
     'Other'
 ];
+const DRIVER_REPORT_REASONS = [
+    'Rude or abusive behavior',
+    'Refused to pay the fare',
+    'Harassment or unsafe behavior',
+    'Damaged the vehicle',
+    'Fake booking or did not show up',
+    'Other'
+];
 
-app.post('/reports', requireAuth('passenger'), rateLimit('report', 10, 60 * 60 * 1000), async (req, res) => {
+app.post('/reports', requireAuth(), rateLimit('report', 10, 60 * 60 * 1000), async (req, res) => {
     try {
+        const byDriver = req.auth.role === 'driver';
+        const reporterRole = byDriver ? 'DRIVER' : 'PASSENGER';
         const { bookingId } = req.body;
         const reason = String(req.body.reason || '').trim();
         const details = String(req.body.details || '').trim().slice(0, 500);
 
-        if (!bookingId || !REPORT_REASONS.includes(reason)) {
+        if (!bookingId || !(byDriver ? DRIVER_REPORT_REASONS : REPORT_REASONS).includes(reason)) {
             return res.status(400).json({ success: false, message: 'Choose a reason for the report.' });
         }
 
         const { data: booking } = await supabase
             .from('bookings').select('id, passenger_id, driver_id').eq('id', bookingId).maybeSingle();
 
-        if (!booking || booking.passenger_id !== req.auth.sub || !booking.driver_id) {
+        // Both people of the trip must be known, and the reporter must be one of them
+        if (!booking || !booking.driver_id || !booking.passenger_id || !isParticipant(req.auth, booking)) {
             return res.status(404).json({ success: false, message: 'Trip not found.' });
         }
 
         const { data: dup } = await supabase
-            .from('reports').select('id').eq('booking_id', booking.id).eq('passenger_id', req.auth.sub).limit(1);
+            .from('reports').select('id').eq('booking_id', booking.id).eq('reporter_role', reporterRole).limit(1);
         if (dup && dup.length > 0) {
             return res.status(409).json({ success: false, message: 'You already reported this trip.' });
         }
 
+        // driver_id and passenger_id always hold the two people of the trip; reporter_role says who made the report
         const { error } = await supabase.from('reports').insert([{
             booking_id: booking.id,
             driver_id: booking.driver_id,
-            passenger_id: req.auth.sub,
+            passenger_id: booking.passenger_id,
+            reporter_role: reporterRole,
             reason,
             details: details || null,
             status: 'OPEN'
@@ -1291,7 +1532,10 @@ app.post('/reports', requireAuth('passenger'), rateLimit('report', 10, 60 * 60 *
             return res.status(400).json({ success: false, message: 'Could not save the report.' });
         }
 
-        res.status(200).json({ success: true, message: 'Report sent. The administrator will review it.' });
+        res.status(200).json({
+            success: true,
+            message: 'Report sent. Only the administrator can see it. The ' + (byDriver ? 'passenger' : 'driver') + ' will not be told.'
+        });
     } catch (err) {
         res.status(500).json({ success: false, message: 'Server error.' });
     }
@@ -1301,11 +1545,20 @@ app.post('/reports', requireAuth('passenger'), rateLimit('report', 10, 60 * 60 *
 
 // What a passenger may know about a driver. The photo is shown only after the administrator approved it.
 async function driverPublicProfile(driverId) {
-    const { data: d } = await supabase
+    const { data: d, error } = await supabase
         .from('drivers')
-        .select('id, full_name, toda_body_number, vehicle_model, plate_number, photo, photo_status, is_verified')
+        .select('id, full_name, toda_body_number, vehicle_model, vehicle_type, vehicle_color, plate_number, photo, photo_status, is_verified')
         .eq('id', driverId).maybeSingle();
+    if (error) {
+        const failure = new Error(error.message);
+        failure.schema = isMissingSchema(error);
+        throw failure;
+    }
     if (!d) return null;
+
+    // The picture of the vehicle is shown only after the administrator approved it, like the photo of the driver
+    const { data: docs } = await supabase
+        .from('driver_documents').select('vehicle_photo, vehicle_photo_status').eq('driver_id', driverId).maybeSingle();
 
     const { data: rated } = await supabase
         .from('bookings').select('rating').eq('driver_id', driverId).not('rating', 'is', null);
@@ -1320,15 +1573,21 @@ async function driverPublicProfile(driverId) {
         full_name: d.full_name,
         toda_body_number: d.toda_body_number,
         vehicle_model: d.vehicle_model,
+        vehicle_type: d.vehicle_type || null,
+        vehicle_color: d.vehicle_color || null,
         plate_number: d.plate_number,
         is_verified: d.is_verified === true,
         photo_status: d.photo_status,
         photo: d.photo_status === 'APPROVED' ? d.photo : null,
+        vehicle_photo: docs && docs.vehicle_photo_status === 'APPROVED' ? docs.vehicle_photo : null,
         avg_rating: n ? parseFloat((total / n).toFixed(2)) : null,
         rating_count: n,
         trips: count || 0
     };
 }
+
+const profileFailure = (res, err) =>
+    res.status(err && err.schema ? 503 : 500).json({ success: false, message: err && err.schema ? SCHEMA_MESSAGE : 'Server error.' });
 
 app.get('/drivers/:id/profile', requireAuth('passenger'), async (req, res) => {
     try {
@@ -1336,55 +1595,192 @@ app.get('/drivers/:id/profile', requireAuth('passenger'), async (req, res) => {
         if (!profile) return res.status(404).json({ success: false, message: 'Driver not found.' });
         res.status(200).json({ success: true, driver: profile });
     } catch (err) {
-        res.status(500).json({ success: false, message: 'Server error.' });
+        profileFailure(res, err);
     }
 });
 
-// The driver's own profile, including their photo even while it waits for approval
+// The driver's own profile, including their photo even while it waits for approval, and the list of requirements
 app.get('/driver/me', requireAuth('driver'), async (req, res) => {
     try {
         const profile = await driverPublicProfile(req.auth.sub);
         if (!profile) return res.status(404).json({ success: false, message: 'Driver not found.' });
 
-        const { data: own } = await supabase.from('drivers').select('photo').eq('id', req.auth.sub).maybeSingle();
-        res.status(200).json({ success: true, driver: { ...profile, photo: own ? own.photo : null } });
-    } catch (err) {
-        res.status(500).json({ success: false, message: 'Server error.' });
-    }
-});
-
-app.post('/driver/profile', requireAuth('driver'), rateLimit('driverprofile', 20, 60 * 60 * 1000), async (req, res) => {
-    try {
-        const update = {};
-
-        if (req.body.plate_number !== undefined) {
-            update.plate_number = cleanText(req.body.plate_number, 12).toUpperCase() || null;
-        }
-
-        if (req.body.photo) {
-            const photo = String(req.body.photo);
-            const m = /^data:image\/jpeg;base64,([A-Za-z0-9+/=]+)$/.exec(photo);
-            if (!m || photo.length > 200000) {
-                return res.status(400).json({ success: false, message: 'The photo must be a small JPEG image.' });
-            }
-            const bytes = Buffer.from(m[1], 'base64');
-            if (bytes.length < 1000 || bytes[0] !== 0xff || bytes[1] !== 0xd8) {
-                return res.status(400).json({ success: false, message: 'That file is not a valid JPEG photo.' });
-            }
-            update.photo = photo;
-            update.photo_status = 'PENDING';
-        }
-
-        if (Object.keys(update).length === 0) {
-            return res.status(400).json({ success: false, message: 'Nothing to save.' });
-        }
-
-        const { error } = await supabase.from('drivers').update(update).eq('id', req.auth.sub);
-        if (error) return res.status(400).json({ success: false, message: 'Could not save your profile.' });
+        const { data: own } = await supabase
+            .from('drivers').select('photo, vehicle_ownership, address, lgu_license_no').eq('id', req.auth.sub).maybeSingle();
+        const need = await loadRequirements(req.auth.sub);
+        if (need.error) throw Object.assign(new Error(need.error.message), { schema: isMissingSchema(need.error) });
 
         res.status(200).json({
             success: true,
-            message: update.photo ? 'Saved. Your photo is waiting for administrator approval.' : 'Saved.'
+            driver: {
+                ...profile,
+                photo: own ? own.photo : null,
+                vehicle_ownership: own ? own.vehicle_ownership : null,
+                address: own ? own.address : null,
+                lgu_license_no: own ? own.lgu_license_no : null
+            },
+            requirements: { complete: need.complete, items: need.items, missing: need.missing }
+        });
+    } catch (err) {
+        profileFailure(res, err);
+    }
+});
+
+// The driver's own vehicle photo and LGU license photo (kept apart from /driver/me because they are large)
+app.get('/driver/documents', requireAuth('driver'), async (req, res) => {
+    try {
+        const { data, error } = await supabase
+            .from('driver_documents')
+            .select('vehicle_photo, vehicle_photo_status, vehicle_photo_note, license_photo, license_photo_status, license_photo_note')
+            .eq('driver_id', req.auth.sub).maybeSingle();
+        if (error) throw Object.assign(new Error(error.message), { schema: isMissingSchema(error) });
+
+        res.status(200).json({
+            success: true,
+            documents: data || {
+                vehicle_photo: null, vehicle_photo_status: 'NONE', vehicle_photo_note: null,
+                license_photo: null, license_photo_status: 'NONE', license_photo_note: null
+            }
+        });
+    } catch (err) {
+        profileFailure(res, err);
+    }
+});
+
+// Stars and "satisfied" counts of one driver, from every rating the passengers gave
+const isSatisfied = (r) => (typeof r.rating_satisfied === 'boolean' ? r.rating_satisfied : r.rating >= 4);
+
+async function ratingSummary(driverId) {
+    const { data, error } = await supabase
+        .from('bookings').select('rating, rating_satisfied').eq('driver_id', driverId).not('rating', 'is', null);
+    if (error) throw Object.assign(new Error(error.message), { schema: isMissingSchema(error) });
+
+    const list = data || [];
+    const total = list.reduce((sum, r) => sum + r.rating, 0);
+    const satisfied = list.filter(isSatisfied).length;
+    return {
+        avg_rating: list.length ? parseFloat((total / list.length).toFixed(2)) : null,
+        rating_count: list.length,
+        satisfied,
+        not_satisfied: list.length - satisfied
+    };
+}
+
+// A light summary for the driver's home screen: what is still missing, and how passengers rated the driver
+app.get('/driver/overview', requireAuth('driver'), async (req, res) => {
+    try {
+        const need = await loadRequirements(req.auth.sub);
+        if (need.error) throw Object.assign(new Error(need.error.message), { schema: isMissingSchema(need.error) });
+        if (need.notFound) return res.status(404).json({ success: false, message: 'Driver not found.' });
+
+        res.status(200).json({
+            success: true,
+            requirements: { complete: need.complete, items: need.items, missing: need.missing },
+            ratings: await ratingSummary(req.auth.sub)
+        });
+    } catch (err) {
+        profileFailure(res, err);
+    }
+});
+
+// The ratings the passengers gave this driver. The passenger's name is not part of it.
+app.get('/driver/ratings', requireAuth('driver'), async (req, res) => {
+    try {
+        const summary = await ratingSummary(req.auth.sub);
+        const { data, error } = await supabase
+            .from('bookings')
+            .select('id, rating, rating_comment, rating_satisfied, rated_at, pickup_name, destination_name')
+            .eq('driver_id', req.auth.sub).not('rating', 'is', null)
+            .order('rated_at', { ascending: false }).limit(50);
+        if (error) throw Object.assign(new Error(error.message), { schema: isMissingSchema(error) });
+
+        res.status(200).json({
+            success: true,
+            summary,
+            ratings: (data || []).map((r) => ({
+                id: r.id,
+                rating: r.rating,
+                satisfied: isSatisfied(r),
+                comment: r.rating_comment || null,
+                rated_at: r.rated_at,
+                pickup_name: r.pickup_name,
+                destination_name: r.destination_name
+            }))
+        });
+    } catch (err) {
+        profileFailure(res, err);
+    }
+});
+
+// Saves the typed details and any new pictures. A new picture waits for the administrator, and a rejected one is replaced.
+async function saveDriverDocuments(driverId, docs) {
+    const values = { ...docs, updated_at: new Date().toISOString() };
+    const { data: existing, error } = await supabase
+        .from('driver_documents').select('driver_id').eq('driver_id', driverId).maybeSingle();
+    if (error) return { error };
+    if (existing) return supabase.from('driver_documents').update(values).eq('driver_id', driverId);
+    return supabase.from('driver_documents').insert([{ driver_id: driverId, ...values }]);
+}
+
+app.post('/driver/profile', requireAuth('driver'), rateLimit('driverprofile', 20, 60 * 60 * 1000), async (req, res) => {
+    try {
+        const typed = readVehicleDetails(req.body, false);
+        if (typed.error) return res.status(400).json({ success: false, message: typed.error });
+        const update = typed.update;
+        const docs = {};
+
+        if (req.body.photo) {
+            const problem = jpegProblem(req.body.photo);
+            if (problem) return res.status(400).json({ success: false, message: jpegMessage(problem, 'photo') });
+            update.photo = String(req.body.photo);
+            update.photo_status = 'PENDING';
+        }
+        if (req.body.vehicle_photo) {
+            const problem = jpegProblem(req.body.vehicle_photo);
+            if (problem) return res.status(400).json({ success: false, message: jpegMessage(problem, 'vehicle photo') });
+            docs.vehicle_photo = String(req.body.vehicle_photo);
+            docs.vehicle_photo_status = 'PENDING';
+            docs.vehicle_photo_note = null;
+        }
+        if (req.body.lgu_license_photo) {
+            const problem = jpegProblem(req.body.lgu_license_photo);
+            if (problem) return res.status(400).json({ success: false, message: jpegMessage(problem, 'license photo') });
+            docs.license_photo = String(req.body.lgu_license_photo);
+            docs.license_photo_status = 'PENDING';
+            docs.license_photo_note = null;
+        }
+
+        if (Object.keys(update).length === 0 && Object.keys(docs).length === 0) {
+            return res.status(400).json({ success: false, message: 'Nothing to save.' });
+        }
+
+        if (Object.keys(update).length > 0) {
+            const { error } = await supabase.from('drivers').update(update).eq('id', req.auth.sub);
+            if (error) {
+                console.error('DRIVER PROFILE SAVE ERROR:', error);
+                if (isMissingSchema(error)) return res.status(503).json({ success: false, message: SCHEMA_MESSAGE });
+                return res.status(400).json({ success: false, message: 'Could not save your profile.' });
+            }
+        }
+        if (Object.keys(docs).length > 0) {
+            const { error } = await saveDriverDocuments(req.auth.sub, docs);
+            if (error) {
+                console.error('DRIVER DOCUMENTS SAVE ERROR:', error);
+                if (isMissingSchema(error)) return res.status(503).json({ success: false, message: SCHEMA_MESSAGE });
+                return res.status(400).json({ success: false, message: 'Could not save your pictures.' });
+            }
+        }
+
+        forgetRequirements(req.auth.sub);
+        const need = await loadRequirements(req.auth.sub);
+        const newPicture = !!(update.photo || docs.vehicle_photo || docs.license_photo);
+
+        res.status(200).json({
+            success: true,
+            message: (newPicture ? 'Saved. Your new picture is waiting for administrator approval.' : 'Saved.') +
+                (need.complete ? ' Your profile is complete. You can accept bookings.' : ''),
+            complete: need.complete === true,
+            missing: need.missing || []
         });
     } catch (err) {
         res.status(500).json({ success: false, message: 'Server error.' });
@@ -1422,7 +1818,7 @@ app.post('/verify-driver', requireAuth('passenger'), rateLimit('verifyqr', 60, 6
 
         res.status(200).json({ success: true, driver: profile });
     } catch (err) {
-        res.status(500).json({ success: false, message: 'Server error.' });
+        profileFailure(res, err);
     }
 });
 
@@ -1508,6 +1904,11 @@ async function eraseAccount(role, id) {
             toda_body_number: 'DEL-' + tag.slice(0, 6),
             plate_number: null,
             vehicle_model: null,
+            vehicle_ownership: null,
+            vehicle_type: null,
+            vehicle_color: null,
+            address: null,
+            lgu_license_no: null,
             photo: null,
             photo_status: 'NONE',
             is_online: false,
@@ -1530,6 +1931,10 @@ async function eraseAccount(role, id) {
 
     await supabase.from('support_messages').delete().eq('user_id', id);
     await supabase.from('password_resets').delete().eq('email', acc.email).eq('role', role);
+    if (role === 'driver') {
+        await supabase.from('driver_documents').delete().eq('driver_id', id);
+        forgetRequirements(id);
+    }
 
     // Old login tokens and open connections stop working right away
     revokedIds.add(String(id));
@@ -1796,7 +2201,7 @@ const FAQ = [
         id: 'rate_report', roles: ['passenger'], title: 'How do I rate or report a driver?',
         strong: ['report', 'rating', 'rate my', 'rate the', 'rate a', 'rate driver', 'complain', 'complaint', 'reklamo', 'overcharge'],
         keywords: ['rate', 'review', 'rude', 'star', 'feedback'],
-        answer: 'When a trip is completed you can rate the driver from 1 to 5 stars. To report a problem tap Report driver (after the trip or in Trip history) and choose a reason: wrong fare, rude or unsafe driving, details that did not match, or other. The administrator reviews every report.'
+        answer: 'When a trip is completed you can rate the driver from 1 to 5 stars and say if you were satisfied or not. The driver can see the rating you gave. To report a problem tap Report driver (after the trip or in Trip history) and choose a reason: wrong fare, rude or unsafe driving, details that did not match, or other. Only the administrator can see a report. The driver is not told about it, and the administrator reviews every report.'
     },
     {
         id: 'history', roles: ['passenger'], title: 'Where is my trip history?',
@@ -1814,13 +2219,20 @@ const FAQ = [
         id: 'd_register', roles: BOTH, title: 'How do I become a verified driver?',
         strong: ['become a driver', 'become driver', 'register as driver', 'driver registration', 'sign up as driver', 'verified driver', 'get verified', 'body number', 'toda'],
         keywords: ['register', 'sign up', 'apply', 'join', 'verified', 'verification'],
-        answer: 'Register as a driver with your name, email, mobile number, password and TODA body number, then type the 6-digit code sent to your email. The administrator checks your body number against the TODA list and verifies you. You can log in only after that. After your first login, add your face photo and plate number in Profile & QR.'
+        answer: 'Register as a driver with your name, email, mobile number, password, TODA body number and home address. Say if you own the vehicle or are renting it, and give its kind (E-Racal, tricycle, motorcycle, van...), color, plate number and your LGU license number. Attach your photo, a photo of the vehicle and a photo of your LGU license. Then type the 6-digit code sent to your email. The administrator checks your details and verifies you. You can log in only after that.'
+    },
+    {
+        id: 'd_requirements', roles: ['driver'], title: 'What do I need before I can accept bookings?',
+        strong: ['requirement', 'requirements', 'complete my profile', 'complete profile', 'profile incomplete', 'incomplete', 'lgu', 'license', 'licence', 'permit', 'cannot accept', 'can\'t accept', 'cant accept', 'owner or renting', 'renting'],
+        keywords: ['complete', 'profile', 'missing'],
+        patterns: [/(complete|finish|fill).*(profile|requirement)/],
+        answer: 'For safety, you must complete your profile before you can go online or accept a booking: your photo, a photo of your vehicle, a photo of your LGU license and its number, if you own the vehicle or are renting it, the kind of vehicle, its color, your plate number and your home address. Open Profile & QR and fill in what is missing. The dashboard shows what is still needed. The administrator checks your pictures, and a rejected picture must be sent again.'
     },
     {
         id: 'd_online', roles: ['driver'], title: 'How do I get bookings?',
         strong: ['go online', 'online', 'offline', 'not receiving', 'no bookings', 'no booking', 'walang booking', 'accept booking'],
         keywords: ['receive', 'get booking', 'accept', 'request'],
-        answer: 'Switch Online on the dashboard and keep the app open, so your location is shared. New bookings appear on your dashboard, and you tap Accept Booking. You can have one trip at a time, so finish the current trip first. Only verified drivers can go online.'
+        answer: 'Switch Online on the dashboard and keep the app open, so your location is shared. New bookings appear on your dashboard, and you tap Accept Booking. You can have one trip at a time, so finish the current trip first. Only verified drivers with a complete profile can go online or accept a booking.'
     },
     {
         id: 'd_complete', roles: ['driver'], title: 'How do I finish a trip?',
@@ -1844,7 +2256,19 @@ const FAQ = [
         id: 'd_photo', roles: ['driver'], title: 'Why is my photo not showing?',
         strong: ['photo', 'picture', 'larawan', 'plate number', 'plate'],
         keywords: ['upload', 'approved', 'rejected'],
-        answer: 'A new photo waits for the administrator to approve it, and passengers only see approved photos. If it was rejected, upload a clearer face photo in Profile & QR. You add your plate number on the same screen.'
+        answer: 'A new photo waits for the administrator to approve it, and passengers only see approved photos. If it was rejected, upload a clearer picture in Profile & QR. The same screen has your vehicle photo, your LGU license photo and your plate number.'
+    },
+    {
+        id: 'd_ratings', roles: ['driver'], title: 'Can I see how passengers rated me?',
+        strong: ['my rating', 'my ratings', 'rated me', 'passengers rated', 'rating', 'ratings', 'stars', 'satisfied', 'feedback'],
+        keywords: ['review', 'star', 'rate'],
+        answer: 'Yes. Tap My ratings on the dashboard. You see your average stars, how many passengers were satisfied or not, and each rating with its comment and date. The passenger\'s name is not shown there.'
+    },
+    {
+        id: 'd_report_passenger', roles: ['driver'], title: 'How do I report a passenger?',
+        strong: ['report passenger', 'report a passenger', 'report my passenger', 'passenger report', 'rude passenger', 'did not pay', 'refused to pay', 'complain', 'complaint', 'report'],
+        keywords: ['violate', 'abuse', 'harass', 'unsafe'],
+        answer: 'Tap Report passenger on your current trip, or open Trip history and tap the trip. Choose a reason, such as rude behavior, refusing to pay the fare, harassment, damage to the vehicle or a fake booking. Only the administrator can see a report. The passenger is not told about it, and the administrator reviews every report.'
     },
     {
         id: 'password', roles: BOTH, title: 'I forgot my password',
@@ -1967,7 +2391,7 @@ app.get('/admin/api/drivers', requireAdmin, async (req, res) => {
     try {
         const { data, error } = await supabase
             .from('drivers')
-            .select('id, full_name, email, phone, toda_body_number, vehicle_model, plate_number, photo_status, email_verified, is_online, is_verified, verified_at, created_at')
+            .select('id, full_name, email, phone, address, toda_body_number, vehicle_model, vehicle_type, vehicle_color, vehicle_ownership, lgu_license_no, plate_number, photo_status, email_verified, is_online, is_verified, verified_at, created_at')
             .not('email', 'like', '%@' + DELETED_EMAIL_DOMAIN)
             .order('created_at', { ascending: false });
 
@@ -1975,8 +2399,12 @@ app.get('/admin/api/drivers', requireAdmin, async (req, res) => {
 
         const { data: rated } = await supabase
             .from('bookings').select('driver_id, rating').not('rating', 'is', null);
+        // Reports made by a driver are about a passenger, so only the ones made by passengers count against a driver
         const { data: reps } = await supabase
-            .from('reports').select('driver_id').eq('status', 'OPEN');
+            .from('reports').select('driver_id, reporter_role').eq('status', 'OPEN');
+        const { data: docRows } = await supabase
+            .from('driver_documents').select('driver_id, ' + DOCUMENT_STATUS_COLUMNS);
+        const docMap = Object.fromEntries((docRows || []).map((x) => [x.driver_id, x]));
 
         const sums = {};
         for (const r of rated || []) {
@@ -1985,14 +2413,25 @@ app.get('/admin/api/drivers', requireAdmin, async (req, res) => {
             s.n += 1;
         }
         const openReports = {};
-        for (const r of reps || []) openReports[r.driver_id] = (openReports[r.driver_id] || 0) + 1;
+        for (const r of reps || []) {
+            if (r.reporter_role === 'DRIVER') continue;
+            openReports[r.driver_id] = (openReports[r.driver_id] || 0) + 1;
+        }
 
-        const drivers = (data || []).map((d) => ({
-            ...d,
-            avg_rating: sums[d.id] ? parseFloat((sums[d.id].total / sums[d.id].n).toFixed(2)) : null,
-            rating_count: sums[d.id] ? sums[d.id].n : 0,
-            open_reports: openReports[d.id] || 0
-        }));
+        const drivers = (data || []).map((d) => {
+            const docs = docMap[d.id];
+            const need = driverRequirements(d, docs);
+            return {
+                ...d,
+                vehicle_photo_status: docs ? docs.vehicle_photo_status : 'NONE',
+                license_photo_status: docs ? docs.license_photo_status : 'NONE',
+                requirements_complete: need.complete,
+                requirements_missing: need.missing,
+                avg_rating: sums[d.id] ? parseFloat((sums[d.id].total / sums[d.id].n).toFixed(2)) : null,
+                rating_count: sums[d.id] ? sums[d.id].n : 0,
+                open_reports: openReports[d.id] || 0
+            };
+        });
 
         res.status(200).json({ success: true, drivers });
     } catch (err) {
@@ -2020,7 +2459,16 @@ app.post('/admin/api/drivers/:id/verify', requireAdmin, async (req, res) => {
         }
 
         logAdmin(verified ? 'DRIVER_VERIFIED' : 'DRIVER_SUSPENDED', data[0].full_name);
-        res.status(200).json({ success: true, message: verified ? 'Driver verified' : 'Driver suspended', driver: data[0] });
+        forgetRequirements(req.params.id);
+
+        // A verified driver still cannot take bookings until the profile is complete
+        const need = verified ? await loadRequirements(req.params.id) : null;
+        res.status(200).json({
+            success: true,
+            message: verified ? 'Driver verified' : 'Driver suspended',
+            driver: data[0],
+            missing: need && need.missing ? need.missing : []
+        });
     } catch (err) {
         res.status(500).json({ success: false, message: 'Server error.' });
     }
@@ -2060,12 +2508,22 @@ app.get('/admin/api/reports', requireAdmin, async (req, res) => {
         const dMap = Object.fromEntries((drivers || []).map((d) => [d.id, d]));
         const pMap = Object.fromEntries((passengers || []).map((p) => [p.id, p]));
 
-        const reports = (data || []).map((r) => ({
-            ...r,
-            driver_name: dMap[r.driver_id] ? dMap[r.driver_id].full_name : null,
-            driver_body_number: dMap[r.driver_id] ? dMap[r.driver_id].toda_body_number : null,
-            passenger_name: pMap[r.passenger_id] ? pMap[r.passenger_id].full_name : null
-        }));
+        // driver_id and passenger_id are the two people of the trip. reporter_role says who made the report.
+        const reports = (data || []).map((r) => {
+            const driverName = dMap[r.driver_id] ? dMap[r.driver_id].full_name : null;
+            const passengerName = pMap[r.passenger_id] ? pMap[r.passenger_id].full_name : null;
+            const byDriver = r.reporter_role === 'DRIVER';
+            return {
+                ...r,
+                reporter_role: byDriver ? 'DRIVER' : 'PASSENGER',
+                driver_name: driverName,
+                driver_body_number: dMap[r.driver_id] ? dMap[r.driver_id].toda_body_number : null,
+                passenger_name: passengerName,
+                reporter_name: byDriver ? driverName : passengerName,
+                reported_name: byDriver ? passengerName : driverName,
+                reported_role: byDriver ? 'PASSENGER' : 'DRIVER'
+            };
+        });
 
         res.status(200).json({ success: true, reports });
     } catch (err) {
@@ -2158,6 +2616,8 @@ app.delete('/admin/api/drivers/:id', requireAdmin, async (req, res) => {
         }
         if (!data || data.length === 0) return res.status(404).json({ success: false, message: 'Driver not found.' });
 
+        await supabase.from('driver_documents').delete().eq('driver_id', req.params.id);
+        forgetRequirements(req.params.id);
         driverSockets.delete(req.params.id);
         revokedIds.add(String(req.params.id));
         io.emit('driver_offline', { driverId: req.params.id });
@@ -2175,7 +2635,16 @@ app.get('/admin/api/passengers', requireAdmin, async (req, res) => {
             .not('email', 'like', '%@' + DELETED_EMAIL_DOMAIN)
             .order('created_at', { ascending: false });
         if (error) return res.status(400).json({ success: false, message: error.message });
-        res.status(200).json({ success: true, passengers: data });
+
+        const { data: reps } = await supabase
+            .from('reports').select('passenger_id').eq('reporter_role', 'DRIVER').eq('status', 'OPEN');
+        const openReports = {};
+        for (const r of reps || []) openReports[r.passenger_id] = (openReports[r.passenger_id] || 0) + 1;
+
+        res.status(200).json({
+            success: true,
+            passengers: (data || []).map((p) => ({ ...p, open_reports: openReports[p.id] || 0 }))
+        });
     } catch (err) {
         res.status(500).json({ success: false, message: 'Server error.' });
     }
@@ -2294,6 +2763,78 @@ app.get('/admin/api/drivers/:id/photo', requireAdmin, async (req, res) => {
     }
 });
 
+// All three pictures of a driver and the details that go with them
+app.get('/admin/api/drivers/:id/documents', requireAdmin, async (req, res) => {
+    try {
+        const { data: d, error } = await supabase
+            .from('drivers')
+            .select('id, full_name, phone, address, toda_body_number, plate_number, vehicle_type, vehicle_color, vehicle_ownership, lgu_license_no, photo, photo_status')
+            .eq('id', req.params.id).maybeSingle();
+        if (error) return res.status(400).json({ success: false, message: 'Could not load the documents.' });
+        if (!d) return res.status(404).json({ success: false, message: 'Driver not found.' });
+
+        const { data: docs } = await supabase
+            .from('driver_documents')
+            .select('vehicle_photo, vehicle_photo_status, vehicle_photo_note, license_photo, license_photo_status, license_photo_note')
+            .eq('driver_id', req.params.id).maybeSingle();
+
+        res.status(200).json({
+            success: true,
+            driver: {
+                ...d,
+                vehicle_photo: docs ? docs.vehicle_photo : null,
+                vehicle_photo_status: docs ? docs.vehicle_photo_status : 'NONE',
+                vehicle_photo_note: docs ? docs.vehicle_photo_note : null,
+                license_photo: docs ? docs.license_photo : null,
+                license_photo_status: docs ? docs.license_photo_status : 'NONE',
+                license_photo_note: docs ? docs.license_photo_note : null
+            }
+        });
+    } catch (err) {
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
+// Approve or reject one picture: which is 'photo' (the driver), 'vehicle' or 'license'.
+// A rejected picture counts as missing again, so the driver cannot accept bookings until a new one is sent.
+app.post('/admin/api/drivers/:id/document-review', requireAdmin, async (req, res) => {
+    try {
+        const which = String(req.body.which || '');
+        const approve = req.body.approve === true;
+        const note = approve ? null : (cleanText(req.body.note, 120) || null);
+        if (!['photo', 'vehicle', 'license'].includes(which)) {
+            return res.status(400).json({ success: false, message: 'Choose which picture to review.' });
+        }
+
+        let name = null;
+        if (which === 'photo') {
+            const { data, error } = await supabase
+                .from('drivers').update({ photo_status: approve ? 'APPROVED' : 'REJECTED' })
+                .eq('id', req.params.id).not('photo', 'is', null).select('full_name');
+            if (error) return res.status(400).json({ success: false, message: 'Could not save the review.' });
+            if (!data || data.length === 0) return res.status(404).json({ success: false, message: 'This driver has no photo.' });
+            name = data[0].full_name;
+        } else {
+            const column = which === 'vehicle' ? 'vehicle_photo' : 'license_photo';
+            const { data, error } = await supabase
+                .from('driver_documents')
+                .update({ [column + '_status']: approve ? 'APPROVED' : 'REJECTED', [column + '_note']: note, updated_at: new Date().toISOString() })
+                .eq('driver_id', req.params.id).not(column, 'is', null).select('driver_id');
+            if (error) return res.status(400).json({ success: false, message: 'Could not save the review.' });
+            if (!data || data.length === 0) return res.status(404).json({ success: false, message: 'This driver has not sent that picture.' });
+            const { data: d } = await supabase.from('drivers').select('full_name').eq('id', req.params.id).maybeSingle();
+            name = d ? d.full_name : req.params.id;
+        }
+
+        forgetRequirements(req.params.id);
+        const label = { photo: 'PHOTO', vehicle: 'VEHICLE_PHOTO', license: 'LICENSE_PHOTO' }[which];
+        logAdmin(label + (approve ? '_APPROVED' : '_REJECTED'), name);
+        res.status(200).json({ success: true, message: approve ? 'Approved' : 'Rejected' });
+    } catch (err) {
+        res.status(500).json({ success: false, message: 'Server error.' });
+    }
+});
+
 app.post('/admin/api/drivers/:id/photo-review', requireAdmin, async (req, res) => {
     try {
         const approve = req.body.approve === true;
@@ -2302,6 +2843,7 @@ app.post('/admin/api/drivers/:id/photo-review', requireAdmin, async (req, res) =
             .eq('id', req.params.id).not('photo', 'is', null).select('full_name');
         if (error) return res.status(400).json({ success: false, message: 'Could not save the review.' });
         if (!data || data.length === 0) return res.status(404).json({ success: false, message: 'This driver has no photo.' });
+        forgetRequirements(req.params.id);
         logAdmin(approve ? 'PHOTO_APPROVED' : 'PHOTO_REJECTED', data[0].full_name);
         res.status(200).json({ success: true, message: approve ? 'Photo approved' : 'Photo rejected' });
     } catch (err) {
@@ -2719,7 +3261,7 @@ io.on('connection', (socket) => {
     socket.on('join_drivers', async () => {
         if (auth.role !== 'driver') return;
         const { data: driver } = await supabase.from('drivers').select('is_verified').eq('id', auth.sub).maybeSingle();
-        if (driver && driver.is_verified) socket.join('drivers');
+        if (driver && driver.is_verified && (await loadRequirements(auth.sub)).complete) socket.join('drivers');
     });
 
     socket.on('join_booking', async (d) => {
@@ -2752,10 +3294,11 @@ io.on('connection', (socket) => {
             socket.data.chatTimes.push(now);
 
             const open = await openTripChat(auth, String(d.bookingId));
-            if (open.error) return reply({ ok: false, message: open.error });
+            if (open.error) return reply({ ok: false, closed: !!open.closed, message: open.error });
 
-            addTripMessage(auth, open.booking, text, socket.id);
-            reply({ ok: true });
+            // The answer carries the saved message, so the sender can show it without asking again
+            const item = addTripMessage(auth, open.booking, text, socket.id);
+            reply({ ok: true, item });
         } catch (err) {
             console.error('SOCKET CHAT ERROR:', err);
             reply({ ok: false, message: 'Could not send.' });
@@ -2773,6 +3316,7 @@ io.on('connection', (socket) => {
                 .maybeSingle();
 
             if (!driver || !driver.is_verified) return;
+            if (!(await loadRequirements(driver.id)).complete) return;     // the profile must be complete first
 
             socket.data.driverId = driver.id;
             socket.data.driverInfo = { fullName: driver.full_name, bodyNumber: driver.toda_body_number };
