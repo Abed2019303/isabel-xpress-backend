@@ -669,8 +669,9 @@
         d.vehicle_ownership === 'OWNER' ? [' ', badge('Owner', 'b-info')] : d.vehicle_ownership === 'RENTING' ? [' ', badge('Renting', 'b-gray')] : null),
       h('td', null, d.is_verified ? badge('Verified', 'b-ok') : badge('Pending', 'b-warn')),
       h('td', null, d.requirements_complete
-        ? badge('Complete', 'b-ok')
-        : h('span', { class: 'badge b-warn', title: 'Missing: ' + (d.requirements_missing || []).join(', ') }, 'Incomplete (' + (d.requirements_missing || []).length + ')')),
+        ? badge('Complete (100%)', 'b-ok')
+        : h('span', { class: 'badge b-warn', title: 'Missing: ' + (d.requirements_missing || []).join(', ') },
+          'Incomplete (' + (typeof d.requirements_percent === 'number' ? d.requirements_percent + '%' : (d.requirements_missing || []).length + ' missing') + ')')),
       h('td', null, h('span', { class: 'dot' + (d.is_online ? ' on' : '') }), d.is_online ? 'Online' : 'Offline'),
       h('td', null, d.avg_rating ? d.avg_rating.toFixed(1) + ' / 5 (' + d.rating_count + ')' : '-'),
       h('td', null, d.open_reports ? badge(d.open_reports + ' open', 'b-warn') : '-'),
@@ -1012,7 +1013,7 @@
     ['Name', (d) => d.full_name], ['Email', (d) => d.email], ['Mobile', (d) => d.phone], ['Body number', (d) => d.toda_body_number],
     ['Plate', (d) => d.plate_number], ['Vehicle kind', (d) => d.vehicle_type], ['Vehicle color', (d) => d.vehicle_color],
     ['Owner or renting', (d) => d.vehicle_ownership], ['Address', (d) => d.address], ['LGU license number', (d) => d.lgu_license_no],
-    ['Verified', (d) => d.is_verified ? 'Yes' : 'No'], ['Profile complete', (d) => d.requirements_complete ? 'Yes' : 'No'],
+    ['Verified', (d) => d.is_verified ? 'Yes' : 'No'], ['Profile complete', (d) => d.requirements_complete ? 'Yes' : 'No'], ['Profile percent', (d) => d.requirements_percent],
     ['Missing', (d) => (d.requirements_missing || []).join('; ')],
     ['Photo status', (d) => d.photo_status], ['Vehicle photo status', (d) => d.vehicle_photo_status], ['License photo status', (d) => d.license_photo_status],
     ['Average rating', (d) => d.avg_rating], ['Ratings', (d) => d.rating_count],
