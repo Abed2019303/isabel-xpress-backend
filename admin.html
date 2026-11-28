@@ -93,6 +93,12 @@
   .modal { background: var(--card); border: 1px solid var(--line); border-radius: 20px; padding: 22px; width: 100%; max-width: 440px; max-height: 90vh; overflow-y: auto; box-shadow: 0 20px 50px rgba(0,0,0,.25); }
   .modal .row { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
   .modal img { width: 100%; max-height: 360px; object-fit: contain; border-radius: 14px; background: var(--bg); }
+  .modal.wide { max-width: 820px; }
+  .kv { display: grid; grid-template-columns: 150px 1fr; gap: 6px 14px; font-size: .9rem; margin: 10px 0 4px; }
+  .docs { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 14px; margin-top: 14px; }
+  .doc { border: 1px solid var(--line); border-radius: 14px; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+  .doc img { max-height: 230px; cursor: zoom-in; }
+  .doc .row { margin-top: auto; }
   .grid2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 24px; }
   .daybars { display: flex; align-items: flex-end; gap: 6px; height: 160px; padding-top: 8px; }
   .daycol { flex: 1; display: flex; flex-direction: column; justify-content: flex-end; align-items: stretch; height: 100%; min-width: 0; }
@@ -170,7 +176,7 @@
 
     <div id="panel-drivers" class="card" hidden>
       <h2>Drivers</h2>
-      <p class="muted">Check each driver's TODA body number against the official list, then verify. Review the profile photo before approving it; passengers only see approved photos. Unverified drivers cannot accept bookings.</p>
+      <p class="muted">Check each driver's TODA body number against the official list, then verify. Open Documents to see the driver's address, vehicle details, photo, vehicle photo and LGU license, and approve or reject each picture; passengers only see approved photos. A driver cannot go online or accept bookings until verified and until the whole profile is complete (a rejected picture counts as missing).</p>
       <div class="toolbar">
         <input id="search-drivers" type="search" placeholder="Search name, email, body or plate">
         <span class="spacer"></span>
@@ -209,10 +215,10 @@
     </div>
 
     <div id="panel-reports" class="card" hidden>
-      <h2>Passenger reports</h2>
-      <p class="muted">Reports sent by passengers about a trip or driver. Review each one, then mark it resolved. Suspend a driver from the Drivers tab if needed.</p>
+      <h2>Reports</h2>
+      <p class="muted">Reports from passengers about a driver, and from drivers about a passenger. Only the administrator can see them; the person who is reported is never shown a report or told who made it. Review each one, then mark it resolved. Suspend a driver from the Drivers tab if needed.</p>
       <div class="toolbar">
-        <input id="search-reports" type="search" placeholder="Search driver, passenger or reason">
+        <input id="search-reports" type="search" placeholder="Search name or reason">
         <span class="spacer"></span>
         <button id="csv-reports" class="neutral small">Export CSV</button>
       </div>
@@ -549,8 +555,10 @@
   async function setVerified(driver, verified) {
     if (!verified && !confirm('Suspend ' + driver.full_name + '? They will be taken offline and cannot accept bookings.')) return;
     try {
-      await send('POST', '/admin/api/drivers/' + encodeURIComponent(driver.id) + '/verify', { verified });
-      toast(driver.full_name + (verified ? ' verified' : ' suspended'));
+      const res = await send('POST', '/admin/api/drivers/' + encodeURIComponent(driver.id) + '/verify', { verified });
+      const missing = verified && Array.isArray(res.missing) ? res.missing : [];
+      toast(driver.full_name + (verified ? ' verified' : ' suspended') +
+        (missing.length ? '. Still missing in the profile: ' + missing.join(', ') + '.' : ''));
       loadAll();
     } catch (e) { toast(e.message); }
   }
@@ -576,33 +584,64 @@
     } catch (e) { toast(e.message); }
   }
 
-  async function reviewPhoto(d) {
+  const isJpeg = (v) => typeof v === 'string' && /^data:image\/jpeg;base64,[A-Za-z0-9+/=]+$/.test(v);
+  const ownershipText = (v) => (v === 'OWNER' ? 'Owner of the vehicle' : v === 'RENTING' ? 'Renting the vehicle' : '-');
+  const vehicleText = (d) => [d.vehicle_type, d.vehicle_color].filter(Boolean).join(', ');
+
+  // A picture in a big window, closed with a click
+  function zoom(src, title) {
+    const o = h('div', { class: 'overlay', onclick: () => o.remove() },
+      h('img', { src, alt: title, style: 'max-width:96vw;max-height:92vh;border-radius:12px;background:#fff' }));
+    document.body.append(o);
+  }
+
+  // All the details and the three pictures of a driver, each picture approved or rejected on its own
+  async function reviewDocuments(d) {
     let info;
-    try { info = (await api('/admin/api/drivers/' + encodeURIComponent(d.id) + '/photo')).driver; }
+    try { info = (await api('/admin/api/drivers/' + encodeURIComponent(d.id) + '/documents')).driver; }
     catch (e) { toast(e.message); return; }
 
-    const ok = typeof info.photo === 'string' && /^data:image\/jpeg;base64,[A-Za-z0-9+/=]+$/.test(info.photo);
     const overlay = h('div', { class: 'overlay' });
     const close = () => overlay.remove();
-    const decide = async (approve) => {
+    const decide = async (which, approve) => {
+      let note = '';
+      // Only the vehicle and license pictures keep a reason the driver can read
+      if (!approve && which !== 'photo') {
+        note = prompt('Why is this picture rejected? The driver will read it (120 characters max). You can leave it empty.');
+        if (note === null) return;
+        note = note.trim().slice(0, 120);
+      }
       try {
-        await send('POST', '/admin/api/drivers/' + encodeURIComponent(d.id) + '/photo-review', { approve });
-        toast(approve ? 'Photo approved' : 'Photo rejected'); close(); loadAll();
+        await send('POST', '/admin/api/drivers/' + encodeURIComponent(d.id) + '/document-review', { which, approve, note });
+        toast(approve ? 'Approved' : 'Rejected'); close(); loadAll();
       } catch (e) { toast(e.message); }
     };
-    overlay.append(h('div', { class: 'modal' },
-      h('h2', null, 'Photo of ' + info.full_name),
-      h('p', { class: 'muted' }, 'Plate number: ' + (info.plate_number || 'not entered') + ' • Status: ' + info.photo_status),
-      ok ? h('img', { src: info.photo, alt: 'Driver photo' }) : h('p', { class: 'empty' }, 'No photo uploaded.'),
-      h('div', { class: 'row' },
-        h('button', { class: 'neutral', onclick: close }, 'Close'),
-        ok ? h('button', { class: 'danger', onclick: () => decide(false) }, 'Reject') : null,
-        ok ? h('button', { onclick: () => decide(true) }, 'Approve') : null)));
+    const kv = (k, v) => [h('div', { class: 'muted' }, k), h('div', null, v || '-')];
+    const card = (title, which, image, status, note) => h('div', { class: 'doc' },
+      h('div', null, h('strong', null, title), ' ', photoBadge(status)),
+      isJpeg(image) ? h('img', { src: image, alt: title, title: 'Click to enlarge', onclick: () => zoom(image, title) })
+                    : h('p', { class: 'empty' }, 'Not sent yet.'),
+      status === 'REJECTED' && note ? h('p', { class: 'muted small' }, 'Reason given to the driver: ' + note) : null,
+      isJpeg(image) ? h('div', { class: 'row' },
+        h('button', { class: 'small danger', onclick: () => decide(which, false) }, 'Reject'),
+        h('button', { class: 'small', onclick: () => decide(which, true) }, 'Approve')) : null);
+
+    overlay.append(h('div', { class: 'modal wide' },
+      h('h2', null, 'Documents of ' + info.full_name),
+      h('div', { class: 'kv' },
+        kv('Mobile number', info.phone), kv('Home address', info.address), kv('TODA body number', info.toda_body_number),
+        kv('Kind and color of vehicle', vehicleText(info)), kv('Plate number', info.plate_number),
+        kv('Owner or renting', ownershipText(info.vehicle_ownership)), kv('LGU license number', info.lgu_license_no)),
+      h('div', { class: 'docs' },
+        card('Photo of the driver', 'photo', info.photo, info.photo_status, null),
+        card('Photo of the vehicle', 'vehicle', info.vehicle_photo, info.vehicle_photo_status, info.vehicle_photo_note),
+        card('LGU license', 'license', info.license_photo, info.license_photo_status, info.license_photo_note)),
+      h('div', { class: 'row' }, h('button', { class: 'neutral', onclick: close }, 'Close'))));
     document.body.append(overlay);
   }
 
   const driverRows = () => drivers.filter((d) =>
-    contains([d.full_name, d.email, d.phone, d.toda_body_number, d.plate_number, d.vehicle_model], val('search-drivers')));
+    contains([d.full_name, d.email, d.phone, d.toda_body_number, d.plate_number, d.vehicle_model, d.vehicle_type, d.vehicle_color, d.address, d.lgu_license_no], val('search-drivers')));
 
   function photoBadge(s) {
     if (s === 'APPROVED') return badge('Approved', 'b-ok');
@@ -617,7 +656,7 @@
       new Date(b.created_at) - new Date(a.created_at));
 
     const head = h('thead', null, h('tr', null,
-      ['Name', 'Email', 'Mobile', 'Body #', 'Plate', 'Vehicle', 'Status', 'Photo', 'Online', 'Rating', 'Reports', 'Registered', '']
+      ['Name', 'Email', 'Mobile', 'Body #', 'Plate', 'Vehicle', 'Status', 'Profile', 'Online', 'Rating', 'Reports', 'Registered', '']
         .map((t) => h('th', null, t))));
 
     const rows = sorted.map((d) => h('tr', null,
@@ -626,9 +665,12 @@
       h('td', null, d.phone || '-'),
       h('td', null, d.toda_body_number || '-'),
       h('td', null, d.plate_number || '-'),
-      h('td', null, d.vehicle_model || '-'),
+      h('td', null, vehicleText(d) || d.vehicle_model || '-',
+        d.vehicle_ownership === 'OWNER' ? [' ', badge('Owner', 'b-info')] : d.vehicle_ownership === 'RENTING' ? [' ', badge('Renting', 'b-gray')] : null),
       h('td', null, d.is_verified ? badge('Verified', 'b-ok') : badge('Pending', 'b-warn')),
-      h('td', null, photoBadge(d.photo_status)),
+      h('td', null, d.requirements_complete
+        ? badge('Complete', 'b-ok')
+        : h('span', { class: 'badge b-warn', title: 'Missing: ' + (d.requirements_missing || []).join(', ') }, 'Incomplete (' + (d.requirements_missing || []).length + ')')),
       h('td', null, h('span', { class: 'dot' + (d.is_online ? ' on' : '') }), d.is_online ? 'Online' : 'Offline'),
       h('td', null, d.avg_rating ? d.avg_rating.toFixed(1) + ' / 5 (' + d.rating_count + ')' : '-'),
       h('td', null, d.open_reports ? badge(d.open_reports + ' open', 'b-warn') : '-'),
@@ -637,8 +679,7 @@
         d.is_verified
           ? h('button', { class: 'small danger', onclick: () => setVerified(d, false) }, 'Suspend')
           : h('button', { class: 'small', onclick: () => setVerified(d, true) }, 'Verify'),
-        d.photo_status && d.photo_status !== 'NONE'
-          ? h('button', { class: 'small neutral', onclick: () => reviewPhoto(d) }, 'Photo') : null,
+        h('button', { class: 'small neutral', onclick: () => reviewDocuments(d) }, 'Documents'),
         h('button', { class: 'small neutral', onclick: () => editDriver(d) }, 'Edit'),
         h('button', { class: 'small danger', onclick: () => deleteDriver(d) }, 'Delete')))));
 
@@ -668,16 +709,17 @@
   const passengerRows = () => passengers.filter((p) => contains([p.full_name, p.email, p.phone], val('search-passengers')));
 
   function renderPassengers() {
-    const head = h('thead', null, h('tr', null, ['Name', 'Email', 'Mobile', 'Registered', ''].map((t) => h('th', null, t))));
+    const head = h('thead', null, h('tr', null, ['Name', 'Email', 'Mobile', 'Reports', 'Registered', ''].map((t) => h('th', null, t))));
     const rows = passengerRows().map((p) => h('tr', null,
       h('td', null, p.full_name),
       h('td', null, p.email, p.email_verified === false ? [' ', badge('email not verified', 'b-warn')] : null),
       h('td', null, p.phone || '-'),
+      h('td', null, p.open_reports ? badge(p.open_reports + ' open', 'b-warn') : '-'),
       h('td', null, fmtDate(p.created_at)),
       h('td', null, h('div', { class: 'actions' },
         h('button', { class: 'small neutral', onclick: () => editPassenger(p) }, 'Edit'),
         h('button', { class: 'small danger', onclick: () => deletePassenger(p) }, 'Delete')))));
-    $('passengersTable').replaceChildren(head, rows.length ? h('tbody', null, rows) : emptyRow(5, 'No passengers found.'));
+    $('passengersTable').replaceChildren(head, rows.length ? h('tbody', null, rows) : emptyRow(6, 'No passengers found.'));
   }
 
   // ---------------------------------------------------------------- bookings
@@ -708,7 +750,7 @@
       h('td', null, fmtFare(b.fare)),
       h('td', null, statusBadge(b.status)),
       h('td', null, b.driver_name ? b.driver_name + ' (#' + (b.driver_body_number || '-') + ')' : '-'),
-      h('td', null, b.rating ? b.rating + ' / 5' : '-'),
+      h('td', null, b.rating ? b.rating + ' / 5' + (b.rating_satisfied === true ? ' (satisfied)' : b.rating_satisfied === false ? ' (not satisfied)' : '') : '-'),
       h('td', null, fmtDate(b.completed_at)),
       h('td', null, (b.status === 'PENDING' || b.status === 'ACCEPTED')
         ? h('button', { class: 'small danger', onclick: () => cancelBooking(b) }, 'Cancel') : null)));
@@ -733,16 +775,19 @@
   }
 
   const reportRows = () => reports.filter((r) =>
-    contains([r.driver_name, r.passenger_name, r.reason, r.details], val('search-reports')));
+    contains([r.reporter_name, r.reported_name, r.driver_name, r.passenger_name, r.reason, r.details], val('search-reports')));
+
+  const roleBadge = (role) => badge(role === 'DRIVER' ? 'Driver' : 'Passenger', role === 'DRIVER' ? 'b-info' : 'b-gray');
 
   function renderReports() {
     const head = h('thead', null, h('tr', null,
-      ['Date', 'Driver', 'Passenger', 'Reason', 'Details', 'Status', ''].map((t) => h('th', null, t))));
+      ['Date', 'Reported by', 'Against', 'Reason', 'Details', 'Status', ''].map((t) => h('th', null, t))));
 
     const rows = reportRows().map((r) => h('tr', null,
       h('td', null, fmtDate(r.created_at)),
-      h('td', null, r.driver_name ? r.driver_name + ' (#' + (r.driver_body_number || '-') + ')' : '-'),
-      h('td', null, r.passenger_name || '-'),
+      h('td', null, roleBadge(r.reporter_role), ' ', r.reporter_name || '-'),
+      h('td', null, roleBadge(r.reported_role), ' ', r.reported_name || '-',
+        r.reported_role === 'DRIVER' && r.driver_body_number ? ' (#' + r.driver_body_number + ')' : ''),
       h('td', null, r.reason || '-'),
       h('td', { style: 'white-space:normal;min-width:180px' }, r.details || '-'),
       h('td', null, r.status === 'OPEN' ? badge('Open', 'b-warn') : badge('Resolved', 'b-ok')),
@@ -965,14 +1010,18 @@
 
   $('csv-drivers').addEventListener('click', () => downloadCsv('drivers', [
     ['Name', (d) => d.full_name], ['Email', (d) => d.email], ['Mobile', (d) => d.phone], ['Body number', (d) => d.toda_body_number],
-    ['Plate', (d) => d.plate_number], ['Vehicle', (d) => d.vehicle_model],
-    ['Verified', (d) => d.is_verified ? 'Yes' : 'No'], ['Photo status', (d) => d.photo_status],
+    ['Plate', (d) => d.plate_number], ['Vehicle kind', (d) => d.vehicle_type], ['Vehicle color', (d) => d.vehicle_color],
+    ['Owner or renting', (d) => d.vehicle_ownership], ['Address', (d) => d.address], ['LGU license number', (d) => d.lgu_license_no],
+    ['Verified', (d) => d.is_verified ? 'Yes' : 'No'], ['Profile complete', (d) => d.requirements_complete ? 'Yes' : 'No'],
+    ['Missing', (d) => (d.requirements_missing || []).join('; ')],
+    ['Photo status', (d) => d.photo_status], ['Vehicle photo status', (d) => d.vehicle_photo_status], ['License photo status', (d) => d.license_photo_status],
     ['Average rating', (d) => d.avg_rating], ['Ratings', (d) => d.rating_count],
     ['Open reports', (d) => d.open_reports], ['Registered', (d) => d.created_at]
   ], driverRows()));
 
   $('csv-passengers').addEventListener('click', () => downloadCsv('passengers', [
-    ['Name', (p) => p.full_name], ['Email', (p) => p.email], ['Mobile', (p) => p.phone], ['Registered', (p) => p.created_at]
+    ['Name', (p) => p.full_name], ['Email', (p) => p.email], ['Mobile', (p) => p.phone],
+    ['Open reports by drivers', (p) => p.open_reports], ['Registered', (p) => p.created_at]
   ], passengerRows()));
 
   $('csv-bookings').addEventListener('click', () => downloadCsv('bookings', [
@@ -980,13 +1029,14 @@
     ['Destination', (b) => b.destination_name], ['Distance km', (b) => b.distance_km], ['Fare', (b) => b.fare],
     ['Discounted', (b) => b.is_discounted ? 'Yes' : 'No'], ['Status', (b) => b.status],
     ['Driver', (b) => b.driver_name], ['Body number', (b) => b.driver_body_number],
-    ['Rating', (b) => b.rating], ['Completed', (b) => b.completed_at]
+    ['Rating', (b) => b.rating], ['Satisfied', (b) => b.rating_satisfied === true ? 'Yes' : b.rating_satisfied === false ? 'No' : ''],
+    ['Rating comment', (b) => b.rating_comment], ['Completed', (b) => b.completed_at]
   ], bookingRows()));
 
   $('csv-reports').addEventListener('click', () => downloadCsv('reports', [
-    ['Date', (r) => r.created_at], ['Driver', (r) => r.driver_name], ['Body number', (r) => r.driver_body_number],
-    ['Passenger', (r) => r.passenger_name], ['Reason', (r) => r.reason], ['Details', (r) => r.details],
-    ['Status', (r) => r.status]
+    ['Date', (r) => r.created_at], ['Reported by', (r) => r.reporter_role], ['Reporter name', (r) => r.reporter_name],
+    ['Against', (r) => r.reported_role], ['Name', (r) => r.reported_name], ['Body number', (r) => r.driver_body_number],
+    ['Reason', (r) => r.reason], ['Details', (r) => r.details], ['Status', (r) => r.status]
   ], reportRows()));
 
   $('csv-activity').addEventListener('click', () => downloadCsv('activity-log', [
